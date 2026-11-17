@@ -60,7 +60,7 @@ version and build, hardware, CPU, RAM, PowerShell host, locale, time zone), then
 | 5 | Desktop heap | Interactive desktop heap set too small; desktop heap failure events |
 | 6 | Handles | GDI/USER handle quotas; processes near their GDI/USER limit; session-wide GDI total; processes holding very large numbers of kernel handles; optional handle growth between two samples |
 | 7 | .NET Framework config files | Missing or corrupt `machine.config` / `web.config` |
-| 8 | Running .NET processes | 32-bit .NET apps near the ~2 GB address-space limit; runtime and version of each .NET process; which Visual C++ runtimes each one has loaded; `System.GC.HeapHardLimit*` in .NET 5+ apps' `runtimeconfig.json` |
+| 8 | Running .NET processes | 32-bit .NET apps near the ~2 GB address-space limit; runtime and version of each .NET process; for self-contained apps (which carry their own .NET and aren't patched by Windows Update), the exact version, where it's loaded from and how many patches it is behind your installed runtime; which Visual C++ runtimes each one has loaded; `System.GC.HeapHardLimit*` in .NET 5+ apps' `runtimeconfig.json` |
 | 9 | DLL injection | `AppInit_DLLs` loaded into every GUI process |
 | 10 | Allocation test | Starts 64-bit and 32-bit Windows PowerShell (.NET Framework) and PowerShell 7 (.NET), and allocates memory in each to confirm the runtime can allocate at all |
 | 11 | Event log | Recent .NET app crashes (`.NET Runtime` events 1022–1026, `Application Error` 1000 inside the runtime), grouped by app with a likely-cause hint; out-of-memory errors from other sources |

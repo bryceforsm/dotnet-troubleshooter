@@ -481,14 +481,23 @@ $netProcs = foreach ($p in Get-Process) {
         $clr  = $mods | Where-Object { $_.ModuleName -in 'clr.dll', 'mscorwks.dll' } | Select-Object -First 1
         $core = $mods | Where-Object { $_.ModuleName -eq 'coreclr.dll' } | Select-Object -First 1
         if (-not ($clr -or $core)) { continue }
+        $coreDir = $null; $selfContained = $false; $netVer = $null
         $runtime = if ($core) {
             # Shared runtime lives in ...\Microsoft.NETCore.App\<version>\coreclr.dll; otherwise it's bundled with the app.
             $coreDir = Split-Path $core.FileName -Parent
             if ((Split-Path $coreDir -Leaf) -match '^\d+\.\d+\.\d+' -and (Split-Path (Split-Path $coreDir -Parent) -Leaf) -eq 'Microsoft.NETCore.App') {
-                ".NET $(Split-Path $coreDir -Leaf)"
+                $netVer = Split-Path $coreDir -Leaf
+                ".NET $netVer"
             } else {
-                $fv = $core.FileVersionInfo
-                ".NET {0}.{1} (self-contained)" -f $fv.FileMajorPart, $fv.FileMinorPart
+                $selfContained = $true
+                # Exact version from the app's own CoreLib, e.g. "10.0.14-servicing.26522.126+0427b9a" -> 10.0.14
+                $coreLib = Join-Path $coreDir 'System.Private.CoreLib.dll'
+                if (Test-Path $coreLib) { $netVer = ("$((Get-Item $coreLib).VersionInfo.ProductVersion)" -split '[-+ ]')[0] }
+                if ($netVer -notmatch '^\d+\.\d+\.\d+$') {
+                    $fv = $core.FileVersionInfo
+                    $netVer = '{0}.{1}' -f $fv.FileMajorPart, $fv.FileMinorPart
+                }
+                ".NET $netVer (self-contained)"
             }
         } else { "Framework $(Get-ModuleVersion $clr)" }
         $desktop = [bool]($mods | Where-Object { $_.ModuleName -in 'PresentationFramework.dll', 'System.Windows.Forms.dll', 'wpfgfx_cor3.dll', 'wpfgfx_v0400.dll' })
@@ -498,7 +507,7 @@ $netProcs = foreach ($p in Get-Process) {
         [pscustomobject]@{
             Name = $p.Name; Id = $p.Id; Bits = $(if ($wow) { 32 } else { 64 }); Runtime = $runtime; GUI = $desktop; VCRT = $vcrt
             PrivateGB = [math]::Round($p.PrivateMemorySize64 / 1GB, 2); VirtualGB = [math]::Round($p.VirtualMemorySize64 / 1GB, 2)
-            Path = $p.Path; IsCore = [bool]$core
+            Path = $p.Path; IsCore = [bool]$core; SelfContained = $selfContained; NetVersion = $netVer; RuntimeDir = $coreDir
         }
     } catch { }
 }
@@ -509,6 +518,34 @@ if ($netProcs.Count) {
         Add-Finding Problem '32-bit limit' "$($np.Name) (PID $($np.Id), $($np.Runtime)) is a 32-bit .NET process using $($np.VirtualGB) GB virtual / $($np.PrivateGB) GB private. 32-bit apps hit OOM at ~1.5-2 GB no matter how much RAM you have." 'Use the app''s 64-bit build, or ask the vendor to enable /LARGEADDRESSAWARE'
     }
     if (-not ($netProcs | Where-Object Bits -eq 32)) { Add-Finding OK '32-bit limit' 'No running 32-bit .NET processes.' }
+
+    # Self-contained apps carry their own .NET: Windows Update .NET patches never reach them.
+    # Compare each one with the newest installed shared runtime of the same major.minor and bitness.
+    $sharedVers = @{}
+    foreach ($rr in $runtimeRoots) {
+        $fxDir = Join-Path $rr.Dir 'Microsoft.NETCore.App'
+        $sharedVers[$rr.Arch] = @(if (Test-Path $fxDir) {
+            Get-ChildItem $fxDir -Directory | ForEach-Object { $v = $null; if ([version]::TryParse($_.Name, [ref]$v)) { $v } }
+        })
+    }
+    foreach ($grp in ($netProcs | Where-Object { $_.SelfContained -and $_.RuntimeDir } | Group-Object RuntimeDir)) {
+        $sc    = $grp.Group[0]
+        $names = ($grp.Group | ForEach-Object Name | Sort-Object -Unique) -join ', '
+        $own   = $null
+        $compare = ''
+        if ([version]::TryParse($sc.NetVersion, [ref]$own) -and $own.Build -ge 0) {
+            $arch   = if ($sc.Bits -eq 32) { 'x86' } else { 'x64' }
+            $newest = @($sharedVers[$arch]) | Where-Object { $_ -and $_.Major -eq $own.Major -and $_.Minor -eq $own.Minor } | Sort-Object -Descending | Select-Object -First 1
+            $compare = if (-not $newest) { "no installed $($own.Major).$($own.Minor) runtime to compare" }
+                       elseif ($newest.Build -gt $own.Build) {
+                           $behind = $newest.Build - $own.Build
+                           "{0} patch{1} behind installed {2}" -f $behind, $(if ($behind -eq 1) { '' } else { 'es' }), $newest
+                       }
+                       else { "same as installed $newest" }
+            $compare = " ($compare)"
+        }
+        Add-Finding Info 'Self-contained' "${names}: own .NET $($sc.NetVersion)$compare in $($sc.RuntimeDir). Not patched by Windows Update; changes only when the app updates."
+    }
 
     # .NET 5+ apps read GC settings from <app>.runtimeconfig.json next to the exe.
     $hardLimitKeys = '^System\.GC\.(HeapHardLimit\w*)$'
