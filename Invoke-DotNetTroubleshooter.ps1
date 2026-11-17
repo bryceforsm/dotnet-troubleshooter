@@ -34,10 +34,23 @@
                                            (missing cached installers/MSIs, stale Programs and Features or
                                            dependency entries, duplicate v14 entries); v14 version consistency;
                                            failed VC_redist installs; crashes inside the C++ runtime DLLs
+     15. Application control            - Smart App Control, WDAC (Code Integrity), AppLocker and Defender ASR
+                                           blocks or detections hitting .NET apps and their DLLs
+     16. TLS and cryptography           - SchUseStrongCrypto / SystemDefaultTlsVersions, TLS protocols turned
+                                           off in SCHANNEL, FIPS mode, Schannel credential errors
+     17. .NET 5+ host resolution        - missing hostfxr, bad registered install location, 32-bit dotnet.exe
+                                           first on PATH, broken DOTNET_ROOT, ".NET not found" start failures
+     18. Component store / .NET 3.5     - .NET 3.5 feature state, DISM /CheckHealth (admin), stuck pending.xml,
+                                           servicing errors in CBS.log
+     19. Temp folders and disk space    - missing or full temp folders (GetTempFileName fails at 65,535 files),
+                                           live GetTempFileName test, low disk space
+     20. Injected DLLs                  - third-party DLLs loaded into several .NET apps (security, overlay,
+                                           hook tools), flagged when apps crash inside them
 
     Default is report-only. Use -Fix to apply safe fixes (backups + restore point first).
     Use -Repair to also run DISM /RestoreHealth and SFC to repair .NET Framework system files.
-    -Fix also runs "ngen executeQueuedItems" and "ngen update" (no-ops when the cache is healthy).
+    -Fix also runs "ngen executeQueuedItems" and "ngen update" (no-ops when the cache is healthy),
+    and sets SchUseStrongCrypto / SystemDefaultTlsVersions = 1 when they are missing or 0.
     Use -ResetNativeImages to delete and rebuild the .NET Framework native image cache (slow:
     10-30+ minutes; close .NET Framework apps first, ideally run from PowerShell 7).
     Supports -WhatIf with -Fix and -ResetNativeImages.
@@ -146,6 +159,35 @@ using System.Runtime.InteropServices;
 public static class OomNative {
     [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
     [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsWow64Process(IntPtr hProcess, out bool wow64);
+}
+'@
+# Separate type so a session that already loaded an older OomNative still gets these.
+Add-Type -ErrorAction SilentlyContinue -TypeDefinition @'
+using System;
+using System.Text;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+public static class DntNative {
+    [DllImport("psapi.dll", SetLastError=true)]
+    static extern bool EnumProcessModulesEx(IntPtr hProcess, [Out] IntPtr[] lphModule, int cb, out int lpcbNeeded, uint dwFilterFlag);
+    [DllImport("psapi.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern uint GetModuleFileNameEx(IntPtr hProcess, IntPtr hModule, StringBuilder lpFilename, int nSize);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern uint QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
+    // All modules (32- and 64-bit). Process.Modules in a 64-bit .NET Framework host only sees the WOW64 stubs of a 32-bit process.
+    public static string[] GetModulePaths(IntPtr hProcess) {
+        IntPtr[] mods = new IntPtr[2048];
+        int needed;
+        if (!EnumProcessModulesEx(hProcess, mods, IntPtr.Size * mods.Length, out needed, 3)) return new string[0];
+        int n = Math.Min(needed / IntPtr.Size, mods.Length);
+        List<string> list = new List<string>();
+        StringBuilder sb = new StringBuilder(1024);
+        for (int i = 0; i < n; i++) {
+            sb.Length = 0;
+            if (GetModuleFileNameEx(hProcess, mods[i], sb, sb.Capacity) > 0) list.Add(sb.ToString());
+        }
+        return list.ToArray();
+    }
 }
 '@
 
@@ -320,9 +362,6 @@ foreach ($rr in $runtimeRoots) {
     }
 }
 if (-not $anyDesktop) { Add-Finding Info '.NET runtimes' 'No .NET 5+ desktop runtime (Microsoft.WindowsDesktop.App) installed. Self-contained apps carry their own.' }
-if ([Environment]::GetEnvironmentVariable('DOTNET_ROOT', 'Machine') -or [Environment]::GetEnvironmentVariable('DOTNET_ROOT', 'User')) {
-    Add-Finding Info '.NET runtimes' 'DOTNET_ROOT is set; framework-dependent apps may load a runtime from that folder instead of Program Files.'
-}
 
 # ---------------------------------------------------------------- 4. exploit protection
 Write-Section '4. Exploit protection (ASLR)'
@@ -497,6 +536,22 @@ function Get-ModuleVersion($m) {
     if (-not $v) { $v = $m.FileVersionInfo.FileVersion }
     if ($v) { ($v -split '[+ ]')[0] } else { '?' }
 }
+function New-ModuleInfo([string]$FilePath) {
+    $o = [pscustomobject]@{ ModuleName = [IO.Path]::GetFileName($FilePath); FileName = $FilePath }
+    $o | Add-Member -MemberType ScriptProperty -Name FileVersionInfo -Value { [Diagnostics.FileVersionInfo]::GetVersionInfo($this.FileName) }
+    $o
+}
+$script:CompanyCache = @{}
+function Get-FileCompany([string]$FilePath) {
+    if (-not $script:CompanyCache.ContainsKey($FilePath)) {
+        $co = ''
+        try { $co = "$([Diagnostics.FileVersionInfo]::GetVersionInfo($FilePath).CompanyName)".Trim() } catch { }
+        $script:CompanyCache[$FilePath] = $co
+    }
+    $script:CompanyCache[$FilePath]
+}
+# Not counted as injected: Windows component store, GAC/native images, GPU drivers, the .NET install itself.
+$notInjectedPath = '\\Windows\\(WinSxS|Microsoft\.NET|assembly|System32\\DriverStore|SystemApps)\\|\\dotnet\\(shared|host)\\'
 $modSkipped = 0
 $netProcs = foreach ($p in Get-Process) {
     if ($p.Id -in 0, 4) { continue }   # Idle / System
@@ -505,8 +560,15 @@ $netProcs = foreach ($p in Get-Process) {
     $mods = @()
     try { $mods = @($p.Modules | Where-Object { $null -ne $_ -and $_.PSObject.Properties['ModuleName'] }) } catch { }
     if (-not $mods.Count) { $modSkipped++; continue }
+    $wow = $false
+    try { [void][OomNative]::IsWow64Process($p.Handle, [ref]$wow) } catch { }
+    if ($wow -and [Environment]::Is64BitProcess -and -not ($mods | Where-Object { $_.ModuleName -eq 'kernel32.dll' })) {
+        # 64-bit Windows PowerShell only got the WOW64 stubs of this 32-bit process: list its real modules natively.
+        $paths = @(try { [DntNative]::GetModulePaths($p.Handle) } catch { })
+        if ($paths.Count) { $mods = @(foreach ($fp in $paths) { New-ModuleInfo $fp }) }
+    }
     try {
-        $clr  = $mods | Where-Object { $_.ModuleName -in 'clr.dll', 'mscorwks.dll' } | Select-Object -First 1
+        $clr  =$mods | Where-Object { $_.ModuleName -in 'clr.dll', 'mscorwks.dll' } | Select-Object -First 1
         $core = $mods | Where-Object { $_.ModuleName -eq 'coreclr.dll' } | Select-Object -First 1
         if (-not ($clr -or $core)) { continue }
         $coreDir = $null; $selfContained = $false; $netVer = $null
@@ -531,11 +593,24 @@ $netProcs = foreach ($p in Get-Process) {
         $desktop = [bool]($mods | Where-Object { $_.ModuleName -in 'PresentationFramework.dll', 'System.Windows.Forms.dll', 'wpfgfx_cor3.dll', 'wpfgfx_v0400.dll' })
         # Visual C++ runtimes loaded (vcruntime140 -> 14, msvcr120 -> 12, ...); app-local copies like vcruntime140_cor3 are ignored
         $vcrt = (@($mods | ForEach-Object { if ($_.ModuleName -match '^(?:vcruntime|msvcr)(\d{2,3})\.dll$') { [int]$Matches[1] / 10 } }) | Sort-Object -Unique) -join ','
-        $wow = $false; [void][OomNative]::IsWow64Process($p.Handle, [ref]$wow)
+        # Third-party modules from outside the app's folder and the runtime. Section 20 reports the ones
+        # found in several apps, which points to something injecting itself (security, overlay, hook tools).
+        $appDir = if ($p.Path) { Split-Path $p.Path -Parent } else { '' }
+        $appCo  = if ($p.Path) { Get-FileCompany $p.Path } else { '' }
+        $foreign = @(foreach ($m in $mods) {
+            $fn = "$($m.FileName)"
+            if (-not $fn -or $fn -match $notInjectedPath) { continue }
+            if ($appDir -and $fn.StartsWith("$appDir\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ($coreDir -and $fn.StartsWith("$coreDir\", [StringComparison]::OrdinalIgnoreCase)) { continue }
+            $co = Get-FileCompany $fn
+            if ($co -match 'Microsoft' -or ($appCo -and $co -eq $appCo)) { continue }
+            $fn
+        })
         [pscustomobject]@{
             Name = $p.Name; Id = $p.Id; Bits = $(if ($wow) { 32 } else { 64 }); Runtime = $runtime; GUI = $desktop; VCRT = $vcrt
             PrivateGB = [math]::Round($p.PrivateMemorySize64 / 1GB, 2); VirtualGB = [math]::Round($p.VirtualMemorySize64 / 1GB, 2)
             Path = $p.Path; IsCore = [bool]$core; SelfContained = $selfContained; NetVersion = $netVer; RuntimeDir = $coreDir
+            Foreign = $foreign
         }
     } catch { }
 }
@@ -1170,6 +1245,529 @@ foreach ($g in ($vcCrashes | Group-Object App, Module | Select-Object -First 8))
 }
 
 if (-not $vcProblems -and $wiOk) { Add-Finding OK 'VC++ orphan' 'No orphaned or broken Visual C++ registrations found.' }
+
+# ---------------------------------------------------------------- 15. application control
+Write-Section '15. Application control: WDAC, Smart App Control, AppLocker, Defender (30 days)'
+$acSince = (Get-Date).AddDays(-30)
+function Get-EventData($Evt) {
+    # Event fields by name (stable across OS languages, unlike the message text)
+    $h = @{}
+    try { foreach ($d in @(([xml]$Evt.ToXml()).Event.EventData.Data)) { $h[$d.GetAttribute('Name')] = $d.InnerText } } catch { }
+    $h
+}
+function Get-First($Table, [string[]]$Keys) {
+    foreach ($k in $Keys) { if ($Table.ContainsKey($k) -and $Table[$k]) { return $Table[$k] } }
+    ''
+}
+# \Device\HarddiskVolume3\... -> C:\...
+$script:DeviceMap = @{}
+try {
+    foreach ($drv in [IO.DriveInfo]::GetDrives()) {
+        $letter = $drv.Name.Substring(0, 2)
+        $sb = New-Object Text.StringBuilder 1024
+        if ([DntNative]::QueryDosDevice($letter, $sb, 1024)) { $script:DeviceMap[$sb.ToString()] = $letter }
+    }
+} catch { }
+function ConvertFrom-DevicePath([string]$Path) {
+    foreach ($k in $script:DeviceMap.Keys) {
+        if ($Path.StartsWith("$k\", [StringComparison]::OrdinalIgnoreCase)) { return $script:DeviceMap[$k] + $Path.Substring($k.Length) }
+    }
+    $Path
+}
+# Does a block involve .NET? Running .NET apps (section 8), runtime folders, native images, runtime DLLs.
+$netAppPaths = @{}
+foreach ($np in $netProcs) { if ($np.Path) { $netAppPaths[$np.Path.ToLower()] = $np.Name } }
+$netFileRegex = '\\(Microsoft\.NET|dotnet|assembly\\NativeImages_[^\\]+)\\|\.ni\.(dll|exe)$|\\(clr|coreclr|clrjit|mscoree|mscoreei|hostfxr|hostpolicy|System\.Private\.CoreLib)\.dll$'
+function Test-NetRelated([string]$Proc, [string]$File) {
+    $netAppPaths.ContainsKey("$Proc".ToLower()) -or "$File" -match $netFileRegex -or "$Proc" -match $netFileRegex
+}
+$acReported = 0
+
+# --- Smart App Control
+$sac = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' 'VerifiedAndReputablePolicyState'
+switch ("$sac") {
+    '1' { Add-Finding Info 'App control' 'Smart App Control is ON: it blocks unsigned or unknown apps and DLLs, including unsigned .NET apps and assemblies. Blocks show below as Code Integrity events.' }
+    '2' { Add-Finding Info 'App control' 'Smart App Control is in evaluation mode (Windows may switch it on, after which unsigned apps and DLLs get blocked).' }
+    default { Add-Finding Info 'App control' 'Smart App Control is off.' }
+}
+
+# --- WDAC policies (CiTool needs admin; Windows 11 22H2+)
+$ciTool = Join-Path $env:WINDIR 'System32\CiTool.exe'
+if ($isAdmin -and (Test-Path $ciTool)) {
+    try {
+        $ciJson = (& $ciTool -lp -json 2>$null | Out-String) | ConvertFrom-Json
+        $pols = @(Get-Prop $ciJson 'Policies')
+        $custom = @($pols | Where-Object { $_ -and (Get-Prop $_ 'IsEnforced') -and -not (Get-Prop $_ 'IsSystemPolicy') })
+        if ($custom.Count) {
+            $names = ($custom | ForEach-Object { $n = Get-Prop $_ 'FriendlyName'; if ($n) { $n } else { Get-Prop $_ 'PolicyID' } }) -join '; '
+            Add-Finding Info 'App control' "$($custom.Count) non-Windows WDAC policy(ies) enforced: $names. They can block .NET apps and their DLLs."
+        } else { Add-Finding OK 'App control' 'No WDAC policies enforced besides the ones built into Windows.' }
+    } catch { }
+}
+
+# --- Code Integrity blocks. 3077/3076 = WDAC/SAC policy (enforced/audit); 3033/3034 = signing level not met.
+$ciEvts = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = 3033, 3034, 3076, 3077; StartTime = $acSince } -MaxEvents 5000 -ErrorAction SilentlyContinue)
+$ciRows = @(foreach ($e in $ciEvts) {
+    $d = Get-EventData $e
+    $file = ConvertFrom-DevicePath (Get-First $d 'FileNameBuffer', 'File Name')
+    $proc = ConvertFrom-DevicePath (Get-First $d 'ProcessNameBuffer', 'Process Name')
+    $net  = Test-NetRelated $proc $file
+    # 3033 is mostly noise (third-party DLLs refused by protected Windows processes): keep only .NET-related ones.
+    if ($e.Id -in 3033, 3034 -and -not $net) { continue }
+    [pscustomobject]@{ Id = $e.Id; Time = $e.TimeCreated; File = $file; Proc = $proc; Net = $net
+                       Policy = (Get-First $d 'PolicyNameBuffer', 'PolicyName', 'Policy Name') }
+})
+$ciBlocks = @($ciRows | Where-Object { $_.Id -in 3077, 3033 })
+foreach ($g in ($ciBlocks | Group-Object File, Proc | Sort-Object { -[int]$_.Group[0].Net }, { -$_.Count } | Select-Object -First 8)) {
+    $l = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    $procName = Split-Path $l.Proc -Leaf
+    if ($l.Id -eq 3077) {
+        $why = if ($l.Policy) { "policy '$($l.Policy)'" } else { 'a Code Integrity policy' }
+        $sev = if ($l.Net) { 'Problem' } else { 'Warn' }
+        Add-Finding $sev 'App control' ("{0} was blocked from loading into {1} by {2}, {3}x, last {4:g}." -f $l.File, $procName, $why, $g.Count, $l.Time) 'Smart App Control or a WDAC policy blocked it: get a signed build from the vendor, or ask whoever manages the policy to allow it (Smart App Control can only be turned off, not given exceptions)'
+    } else {
+        Add-Finding Warn 'App control' ("{0} could not load into {1}: it doesn't meet the signing level that process requires ({2}x, last {3:g})." -f $l.File, $procName, $g.Count, $l.Time) 'Usually harmless; matters only if it is the failing app or one of its DLLs (repair or reinstall the app)'
+    }
+    $acReported++
+}
+$ciAudit = @($ciRows | Where-Object { $_.Id -in 3076, 3034 })
+if ($ciAudit.Count) {
+    $files = ($ciAudit | ForEach-Object { Split-Path $_.File -Leaf } | Sort-Object -Unique | Select-Object -First 5) -join ', '
+    Add-Finding Info 'App control' "$($ciAudit.Count) .NET-related audit-mode Code Integrity event(s) (would be blocked if the policy were enforced): $files"
+}
+
+# --- AppLocker
+$alEnforced = @()
+try {
+    $alXml = [xml](Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop)
+    $alEnforced = @($alXml.SelectNodes('//RuleCollection') | Where-Object { $_.HasChildNodes -and $_.GetAttribute('EnforcementMode') -ne 'AuditOnly' } | ForEach-Object { $_.GetAttribute('Type') })
+} catch { }
+if ($alEnforced.Count) {
+    $svc = Get-Service AppIDSvc -ErrorAction SilentlyContinue
+    $svcTxt = if ($svc) { "Application Identity service: $($svc.Status)" } else { 'Application Identity service not found' }
+    $dllTxt = if ($alEnforced -contains 'Dll') { ' DLL rules also apply to .NET assemblies loaded from disk.' } else { '' }
+    Add-Finding Info 'App control' "AppLocker rules are enforced for: $($alEnforced -join ', ') ($svcTxt).$dllTxt"
+}
+$alEvts = @(foreach ($log in 'Microsoft-Windows-AppLocker/EXE and DLL', 'Microsoft-Windows-AppLocker/MSI and Script') {
+    Get-WinEvent -FilterHashtable @{ LogName = $log; Id = 8004, 8007; StartTime = $acSince } -MaxEvents 2000 -ErrorAction SilentlyContinue
+})
+$alRows = @(foreach ($e in $alEvts) {
+    $d = Get-EventData $e
+    $file = Get-First $d 'FullFilePath', 'FilePath'
+    [pscustomobject]@{ Time = $e.TimeCreated; File = $file; Rule = (Get-First $d 'RuleName', 'RuleNameBuffer'); Net = (Test-NetRelated '' $file) -or $netAppPaths.ContainsKey($file.ToLower()) }
+})
+foreach ($g in ($alRows | Group-Object File | Sort-Object Count -Descending | Select-Object -First 5)) {
+    $l = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    $sev = if ($l.Net) { 'Problem' } else { 'Warn' }
+    Add-Finding $sev 'App control' ("AppLocker blocked {0} {1}x, last {2:g}." -f $l.File, $g.Count, $l.Time) 'Ask whoever manages AppLocker to allow it (AppLocker event log: Applications and Services Logs > Microsoft > Windows > AppLocker)'
+    $acReported++
+}
+
+# --- Defender: Attack Surface Reduction rules and quarantined files
+$asrNames = @{
+    '01443614-cd74-433a-b99e-2ecdc07bfc25' = 'Block executable files unless they meet a prevalence, age, or trusted list criterion'
+    'b2b3f03d-6a65-4f7b-a9c7-1c7ef74a9ba4' = 'Block untrusted and unsigned processes that run from USB'
+    'd4f940ab-401b-4efc-aadc-ad5f3c50688a' = 'Block all Office applications from creating child processes'
+    '3b576869-a4ec-4529-8536-b80a7769e899' = 'Block Office applications from creating executable content'
+    '75668c1f-73b5-4cf0-bb93-3ecf5cb7cc84' = 'Block Office applications from injecting code into other processes'
+    '92e97fa1-2edf-4476-bdd6-9dd0b4dddc7b' = 'Block Win32 API calls from Office macros'
+    '26190899-1602-49e8-8b27-eb1d0a1ce869' = 'Block Office communication application from creating child processes'
+    'be9ba2d9-53ea-4cdc-84e5-9b1eeee46550' = 'Block executable content from email client and webmail'
+    'd3e037e1-3eb8-44c8-a917-57927947596d' = 'Block JavaScript or VBScript from launching downloaded executable content'
+    '5beb7efe-fd9a-4556-801d-275e5ffc04cc' = 'Block execution of potentially obfuscated scripts'
+    '9e6c4e1f-7d60-472f-ba1a-a39ef669e4b2' = 'Block credential stealing from the Windows local security authority subsystem'
+    'd1e49aac-8f56-4280-b9ba-993a6d77406c' = 'Block process creations originating from PSExec and WMI commands'
+    'e6db77e5-3df2-4cf1-b95a-636979351e5b' = 'Block persistence through WMI event subscription'
+    'c1db55ab-c21a-4637-bb3f-a12568109d35' = 'Use advanced protection against ransomware'
+    '7674ba52-37eb-4a4f-a9a1-f0f9a1619a2c' = 'Block Adobe Reader from creating child processes'
+    '56a863a9-875e-4185-98a7-b882c64b5ce5' = 'Block abuse of exploited vulnerable signed drivers'
+    '33ddedf1-c6e0-47cb-833e-de6133960387' = 'Block rebooting machine in Safe Mode'
+    'c0033c00-d16d-4114-a5a0-dc9b3a7d2ceb' = 'Block use of copied or impersonated system tools'
+    'a8f5898e-1dc8-49a9-9878-85004b8a61e6' = 'Block Webshell creation for Servers'
+}
+function Get-AsrName([string]$Id) { $k = $Id.Trim('{}').ToLower(); if ($asrNames.ContainsKey($k)) { $asrNames[$k] } else { "ASR rule $Id" } }
+try {
+    $mp = Get-MpPreference -ErrorAction Stop
+    $asrIds  = @($mp.AttackSurfaceReductionRules_Ids | Where-Object { $_ })
+    $asrActs = @($mp.AttackSurfaceReductionRules_Actions)
+    $asrOn = @(for ($i = 0; $i -lt $asrIds.Count; $i++) {
+        $act = if ($i -lt $asrActs.Count) { [int]$asrActs[$i] } else { 0 }
+        if ($act -in 1, 6) { [pscustomobject]@{ Id = "$($asrIds[$i])".ToLower(); Mode = $(if ($act -eq 1) { 'block' } else { 'warn' }) } }
+    })
+    if ($asrOn.Count) {
+        Add-Finding Info 'App control' "$($asrOn.Count) Defender Attack Surface Reduction rule(s) active in block/warn mode."
+        if ($asrOn | Where-Object Id -eq '01443614-cd74-433a-b99e-2ecdc07bfc25') {
+            Add-Finding Warn 'App control' "ASR rule '$(Get-AsrName '01443614-cd74-433a-b99e-2ecdc07bfc25')' is on. It blocks new or rarely seen executables, which often catches in-house or freshly updated .NET apps." 'If an app is blocked (Defender event 1121 below), ask whoever manages Defender to add an exclusion'
+        }
+    }
+} catch { }
+$defLog = 'Microsoft-Windows-Windows Defender/Operational'
+$asrEvts = @(Get-WinEvent -FilterHashtable @{ LogName = $defLog; Id = 1121; StartTime = $acSince } -MaxEvents 2000 -ErrorAction SilentlyContinue)
+$asrRows = @(foreach ($e in $asrEvts) {
+    $d = Get-EventData $e
+    [pscustomobject]@{ Time = $e.TimeCreated; Rule = (Get-First $d 'ID'); Path = (Get-First $d 'Path'); Proc = (Get-First $d 'Process Name') }
+})
+foreach ($g in ($asrRows | Group-Object Rule, Path | Sort-Object Count -Descending | Select-Object -First 5)) {
+    $l = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    $sev = if (Test-NetRelated $l.Proc $l.Path) { 'Problem' } else { 'Warn' }
+    Add-Finding $sev 'App control' ("Defender ASR blocked {0} (process {1}) {2}x, last {3:g}: {4}." -f $l.Path, (Split-Path $l.Proc -Leaf), $g.Count, $l.Time, (Get-AsrName $l.Rule)) 'Ask whoever manages Defender to add an ASR exclusion for this file'
+    $acReported++
+}
+# Malware detections (1116) on exe/dll files: a quarantined app file looks like FileNotFound or a crash on start.
+$avEvts = @(Get-WinEvent -FilterHashtable @{ LogName = $defLog; Id = 1116; StartTime = $acSince } -MaxEvents 500 -ErrorAction SilentlyContinue)
+$avRows = @(foreach ($e in $avEvts) {
+    $d = Get-EventData $e
+    $path = (Get-First $d 'Path') -replace '^\w+:_', ''
+    if ($path -notmatch '\.(exe|dll)\b') { continue }
+    [pscustomobject]@{ Time = $e.TimeCreated; Threat = (Get-First $d 'Threat Name'); Path = $path }
+})
+foreach ($g in ($avRows | Group-Object Path | Select-Object -First 5)) {
+    $l = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    Add-Finding Warn 'App control' ("Defender detected {0} in {1} ({2:g}). If it was quarantined, the app that uses it fails to load it." -f $l.Threat, $l.Path, $l.Time) 'Check Windows Security > Protection history. Restore only if you are sure it is a false positive'
+    $acReported++
+}
+if (-not $acReported) { Add-Finding OK 'App control' 'No Code Integrity, AppLocker or Defender blocks affecting .NET apps in 30 days.' }
+
+# ---------------------------------------------------------------- 16. TLS and cryptography
+Write-Section '16. TLS and cryptography (.NET Framework HTTPS connections)'
+$netfx35 = "$(Get-RegValue 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v3.5' 'Install')" -eq '1'
+$tlsKeys = @(
+    @{ Ps = 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319';             Native = 'HKLM\SOFTWARE\Microsoft\.NETFramework\v4.0.30319' }
+    @{ Ps = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319'; Native = 'HKLM\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319' }
+)
+if ($netfx35) {
+    $tlsKeys += @{ Ps = 'HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727';             Native = 'HKLM\SOFTWARE\Microsoft\.NETFramework\v2.0.50727' }
+    $tlsKeys += @{ Ps = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v2.0.50727'; Native = 'HKLM\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v2.0.50727' }
+}
+if (-not [Environment]::Is64BitOperatingSystem) { $tlsKeys = @($tlsKeys | Where-Object { $_.Ps -notmatch 'WOW6432Node' }) }
+$tlsMissing = @(); $tlsZero = @()
+foreach ($tk in $tlsKeys) {
+    foreach ($vn in 'SchUseStrongCrypto', 'SystemDefaultTlsVersions') {
+        $val = Get-RegValue $tk.Ps $vn
+        if ($null -eq $val) { $tlsMissing += $tk.Native } elseif ("$val" -eq '0') { $tlsZero += "$($tk.Native)\$vn" }
+    }
+}
+$tlsMissing = @($tlsMissing | Select-Object -Unique)
+if ($tlsZero.Count) {
+    Add-Finding Warn 'TLS' "Set to 0: $($tlsZero -join ', '). This forces .NET Framework apps onto old TLS versions that most servers now refuse." 'Fix: set SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1'
+}
+if ($tlsMissing.Count) {
+    Add-Finding Info 'TLS' ("SchUseStrongCrypto / SystemDefaultTlsVersions not set under {0}. Apps built for .NET Framework 4.6.2 or older{1} may then try only TLS 1.0 and fail to connect to servers that require TLS 1.2+." -f (($tlsMissing | ForEach-Object { $_ -replace '^HKLM\\SOFTWARE\\', '' }) -join ', '), $(if ($netfx35) { ' (and 3.5 apps)' } else { '' })) 'Fix: set SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1 (Microsoft''s recommended setting; restart the apps afterwards)'
+}
+if (-not $tlsZero.Count -and -not $tlsMissing.Count) { Add-Finding OK 'TLS' '.NET Framework uses the OS TLS defaults and strong crypto (SchUseStrongCrypto / SystemDefaultTlsVersions = 1).' }
+if ($Fix -and ($tlsZero.Count -or $tlsMissing.Count)) {
+    foreach ($tk in $tlsKeys) {
+        if ($PSCmdlet.ShouldProcess($tk.Native, 'Set SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1')) {
+            if (Test-Path $tk.Ps) { Backup-RegKey $tk.Native } else { Initialize-Backup; New-Item -Path $tk.Ps -Force | Out-Null }
+            Set-ItemProperty -Path $tk.Ps -Name SchUseStrongCrypto -Value 1 -Type DWord
+            Set-ItemProperty -Path $tk.Ps -Name SystemDefaultTlsVersions -Value 1 -Type DWord
+        }
+    }
+    if (-not $WhatIfPreference) { Add-Finding OK 'TLS' 'Set SchUseStrongCrypto=1 and SystemDefaultTlsVersions=1. Restart .NET Framework apps to pick it up.' }
+}
+
+# SCHANNEL protocol switches (client side is what apps use)
+$schRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols'
+$schOff = @()
+foreach ($proto in 'TLS 1.0', 'TLS 1.1', 'TLS 1.2', 'TLS 1.3') {
+    $ck = "$schRoot\$proto\Client"
+    $en = Get-RegValue $ck 'Enabled'; $dbd = Get-RegValue $ck 'DisabledByDefault'
+    if ("$en" -eq '0' -or "$dbd" -eq '1') {
+        $state = if ("$en" -eq '0') { 'disabled' } else { 'off by default' }
+        if ($proto -eq 'TLS 1.2') {
+            Add-Finding Problem 'TLS' "TLS 1.2 is $state for clients ($ck). Nearly every HTTPS connection from .NET apps will fail." 'Manual: set Enabled=1 and DisabledByDefault=0 (check whether a group policy or hardening tool set it)'
+        } else { $schOff += "$proto $state" }
+    }
+}
+if ($schOff.Count) { Add-Finding Info 'TLS' "Client protocols turned off in SCHANNEL: $($schOff -join ', '). Apps that hard-code those versions can't connect; apps using OS defaults are fine." }
+$fips = Get-RegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\FipsAlgorithmPolicy' 'Enabled'
+if ("$fips" -eq '1') {
+    Add-Finding Warn 'Crypto' 'FIPS mode is on. .NET Framework apps that use MD5, RijndaelManaged or other non-FIPS classes throw InvalidOperationException ("not part of the Windows Platform FIPS validated algorithms").' 'Manual: usually set by group policy for compliance; ask IT, or the vendor for a FIPS-compliant build'
+} else { Add-Finding OK 'Crypto' 'FIPS mode is off.' }
+$schEvts = @(Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Schannel'; Id = 36870, 36871; StartTime = (Get-Date).AddDays(-7) } -MaxEvents 500 -ErrorAction SilentlyContinue)
+if ($schEvts.Count) {
+    Add-Finding Warn 'TLS' ("{0} Schannel credential error(s) (36870/36871) in 7 days, last {1:g}: Windows could not set up TLS for an app." -f $schEvts.Count, $schEvts[0].TimeCreated) 'Usually disabled protocols/cipher suites (see above) or broken permissions on C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys'
+}
+
+# ---------------------------------------------------------------- 17. .NET 5+ host resolution
+Write-Section '17. .NET 5+ host resolution ("You must install .NET" errors)'
+$hostReported = 0
+$reg32 = $null
+try { $reg32 = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry32') } catch { }
+foreach ($rr in $runtimeRoots) {
+    $root  = Split-Path $rr.Dir -Parent   # ...\dotnet
+    $rtVers = @(if (Test-Path (Join-Path $rr.Dir 'Microsoft.NETCore.App')) {
+        Get-ChildItem (Join-Path $rr.Dir 'Microsoft.NETCore.App') -Directory | ForEach-Object { $v = $null; if ([version]::TryParse(($_.Name -split '-')[0], [ref]$v)) { $v } }
+    })
+    $fxrVers = @(if (Test-Path (Join-Path $root 'host\fxr')) {
+        Get-ChildItem (Join-Path $root 'host\fxr') -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'hostfxr.dll') } |
+            ForEach-Object { $v = $null; if ([version]::TryParse(($_.Name -split '-')[0], [ref]$v)) { $v } }
+    })
+    # Where apphost looks first: HKLM\SOFTWARE\dotnet\Setup\InstalledVersions\<arch>\InstallLocation (32-bit registry view)
+    $regLoc = $null
+    if ($reg32) { $rk = $reg32.OpenSubKey("SOFTWARE\dotnet\Setup\InstalledVersions\$($rr.Arch)"); if ($rk) { $regLoc = $rk.GetValue('InstallLocation'); $rk.Close() } }
+    if ($regLoc) {
+        $regTrim = $regLoc.TrimEnd('\')
+        if (-not (Test-Path (Join-Path $regTrim 'host\fxr'))) {
+            Add-Finding Problem '.NET host' "$($rr.Arch) .NET is registered at $regLoc, but there's no .NET there. Framework-dependent $($rr.Arch) apps will say .NET is not installed." "Reinstall the latest $($rr.Arch) .NET runtime, or fix HKLM\SOFTWARE\WOW6432Node\dotnet\Setup\InstalledVersions\$($rr.Arch)\InstallLocation"
+            $hostReported++
+        } elseif ($regTrim -ne $root.TrimEnd('\')) {
+            Add-Finding Warn '.NET host' "$($rr.Arch) apps load .NET from $regLoc (registered location), not $root." 'Expected only for a custom install location; otherwise reinstall the runtime'
+            $hostReported++
+        }
+        if ($rr.Arch -eq 'x64' -and $regTrim -match '\(x86\)') {
+            Add-Finding Problem '.NET host' "The x64 .NET install location points at the 32-bit folder ($regLoc). 64-bit apps can't start." 'Reinstall the latest x64 .NET runtime'
+            $hostReported++
+        }
+    }
+    if (-not $rtVers.Count) { continue }
+    $newestRt = $rtVers | Sort-Object -Descending | Select-Object -First 1
+    if (-not $fxrVers.Count) {
+        Add-Finding Problem '.NET host' "$($rr.Arch): .NET runtimes are installed in $($rr.Dir) but hostfxr.dll is missing from $root\host\fxr. Every framework-dependent $($rr.Arch) .NET app fails with 'You must install .NET'." "Repair or reinstall the .NET $($newestRt.Major).$($newestRt.Minor) $($rr.Arch) runtime"
+        $hostReported++
+    } else {
+        $newestFxr = $fxrVers | Sort-Object -Descending | Select-Object -First 1
+        if (($newestFxr.Major * 1000 + $newestFxr.Minor) -lt ($newestRt.Major * 1000 + $newestRt.Minor)) {
+            Add-Finding Warn '.NET host' "$($rr.Arch): newest host (hostfxr $newestFxr) is older than the newest runtime ($newestRt). Looks like a partial install; .NET $($newestRt.Major) apps may fail to start." "Repair or reinstall the .NET $($newestRt.Major).$($newestRt.Minor) $($rr.Arch) runtime"
+            $hostReported++
+        }
+    }
+}
+
+# dotnet.exe on PATH: the first one wins for "dotnet app.dll" and the dotnet CLI
+$pathDirs = @(foreach ($scope in 'Machine', 'User') { "$([Environment]::GetEnvironmentVariable('PATH', $scope))" -split ';' | Where-Object { $_ } })
+$firstDotnet = $pathDirs | Where-Object { Test-Path (Join-Path ([Environment]::ExpandEnvironmentVariables($_)) 'dotnet.exe') } | Select-Object -First 1
+if ($firstDotnet -and [Environment]::Is64BitOperatingSystem -and $pf86 -and ([Environment]::ExpandEnvironmentVariables($firstDotnet)).StartsWith($pf86, [StringComparison]::OrdinalIgnoreCase)) {
+    Add-Finding Warn '.NET host' "The 32-bit dotnet.exe ($firstDotnet) comes first on PATH. 'dotnet' commands and 'dotnet app.dll' run 32-bit and won't see the x64 runtimes." 'Manual: move the x64 dotnet folder before the (x86) one in the system PATH'
+    $hostReported++
+}
+
+# DOTNET_ROOT variables override where apps look for .NET
+foreach ($vn in 'DOTNET_ROOT', 'DOTNET_ROOT(x86)', 'DOTNET_ROOT_X64', 'DOTNET_ROOT_X86', 'DOTNET_ROOT_ARM64') {
+    foreach ($scope in 'Machine', 'User') {
+        $val = [Environment]::GetEnvironmentVariable($vn, $scope)
+        if (-not $val) { continue }
+        $hostReported++
+        if (-not (Test-Path (Join-Path $val 'host\fxr'))) {
+            Add-Finding Problem '.NET host' "$vn ($scope) = $val, but there's no .NET in that folder. Apps that honor it will say .NET is not installed." "Manual: remove $vn or point it at a .NET install folder"
+        } elseif ($vn -in 'DOTNET_ROOT', 'DOTNET_ROOT_X64' -and $pf86 -and $val.StartsWith($pf86, [StringComparison]::OrdinalIgnoreCase)) {
+            Add-Finding Warn '.NET host' "$vn ($scope) = $val points at the 32-bit .NET folder; 64-bit apps will look there for their runtime." "Manual: use DOTNET_ROOT(x86) for the 32-bit folder, or remove $vn"
+        } else {
+            Add-Finding Info '.NET host' "$vn ($scope) = $val. Framework-dependent apps load .NET from there instead of Program Files."
+        }
+    }
+}
+foreach ($vn in 'DOTNET_ROLL_FORWARD', 'DOTNET_ROLL_FORWARD_TO_PRERELEASE', 'DOTNET_MULTILEVEL_LOOKUP') {
+    foreach ($scope in 'Machine', 'User') {
+        $val = [Environment]::GetEnvironmentVariable($vn, $scope)
+        if ($val) { Add-Finding Info '.NET host' "$vn ($scope) = $val changes which runtime version apps pick."; $hostReported++ }
+    }
+}
+
+# Apps that failed to start because their framework wasn't found (logged by the app host)
+$hostEvts = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = '.NET Runtime'; Level = 1, 2; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Message -match 'You must install|framework .*(was not|not) found|hostfxr|install or update \.NET' })
+$hostRows = @(foreach ($e in $hostEvts) {
+    $m = $e.Message
+    $app = Get-EventField $m 'Application:\s*(\S+)'
+    if (-not $app) { $app = Get-EventField $m 'App:\s*(.+)' }
+    $fw = if ($m -match "Framework:\s*'([^']+)',\s*(?:\(minimum\)\s*)?version\s*'([^']+)'\s*\((\w+)\)") { "$($Matches[1]) $($Matches[2]) ($($Matches[3]))" } else { '' }
+    [pscustomobject]@{ Time = $e.TimeCreated; App = $(if ($app) { $app } else { '(unknown app)' }); Fw = $fw }
+})
+foreach ($g in ($hostRows | Group-Object App, Fw | Select-Object -First 5)) {
+    $l = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    $need = if ($l.Fw) { " It needs $($l.Fw)." } else { '' }
+    Add-Finding Problem '.NET host' ("{0} failed to start {1}x because .NET wasn't found (last {2:g}).{3}" -f $l.App, $g.Count, $l.Time, $need) 'Install that runtime (same major version and x64/x86; WinForms/WPF apps need the Windows Desktop Runtime), then check the findings above'
+    $hostReported++
+}
+if (-not $hostReported) { Add-Finding OK '.NET host' 'App host can find the installed .NET runtimes; no ".NET not found" start failures in 30 days.' }
+
+# ---------------------------------------------------------------- 18. component store / .NET 3.5
+Write-Section '18. Windows component store and .NET Framework 3.5'
+# NetFx3 optional feature: 1 = enabled, 2 = disabled, 3 = absent (payload removed)
+$fx3 = Get-CimInstance Win32_OptionalFeature -Filter "Name='NetFx3'" -ErrorAction SilentlyContinue
+$fx3State = if ($fx3) { [int]$fx3.InstallState } else { 0 }
+if ($isAdmin) {
+    try {
+        $fx3Feat = Get-WindowsOptionalFeature -Online -FeatureName NetFx3 -ErrorAction Stop
+        if ("$($fx3Feat.State)" -match 'Pending') {
+            Add-Finding Warn '.NET 3.5' ".NET Framework 3.5 is $($fx3Feat.State): the change finishes at the next reboot." 'Reboot'
+        }
+    } catch { }
+}
+switch ($fx3State) {
+    1 {
+        if ($netfx35) { Add-Finding OK '.NET 3.5' '.NET Framework 3.5 (includes 2.0 and 3.0) is enabled.' }
+        else { Add-Finding Warn '.NET 3.5' '.NET Framework 3.5 is enabled as a Windows feature, but its setup registration (NDP\v3.5) is missing. It looks half-installed.' 'Elevated: DISM /Online /Disable-Feature /FeatureName:NetFx3, reboot, then DISM /Online /Enable-Feature /FeatureName:NetFx3 /All' }
+    }
+    { $_ -in 2, 3 } { Add-Finding Info '.NET 3.5' '.NET Framework 3.5 is not enabled. Only apps built for .NET 2.0-3.5 need it; Windows offers to install it when one starts (needs Windows Update, or install media on WSUS-managed PCs: errors 0x800F0954 / 0x800F081F).' }
+    default { Add-Finding Info '.NET 3.5' 'Could not read the .NET Framework 3.5 feature state.' }
+}
+
+# Component store health. CheckHealth only reads the flag a previous scan left, so it takes seconds.
+if ($isAdmin) {
+    $dismOut = (& dism.exe /English /Online /Cleanup-Image /CheckHealth 2>&1 | Out-String)
+    if ($dismOut -match 'No component store corruption detected') {
+        Add-Finding OK 'Component store' 'DISM: no component store corruption detected.'
+    } elseif ($dismOut -match 'component store is repairable') {
+        Add-Finding Problem 'Component store' 'DISM: the component store is corrupt but repairable. Windows updates (including .NET Framework updates) can fail until it is repaired.' 'In an elevated prompt: DISM /Online /Cleanup-Image /RestoreHealth, then sfc /scannow, then reboot and retry Windows Update (or re-run this script with -Repair, which runs both). If DISM fails with 0x800f081f or 0x800f0906 (can''t download repair files, common with WSUS), mount a Windows ISO of the same version and add /Source:WIM:<drive>:\sources\install.wim:<index> /LimitAccess'
+    } elseif ($dismOut -match 'not repairable|cannot be repaired') {
+        Add-Finding Problem 'Component store' 'DISM: the component store is corrupt and cannot be repaired online.' 'Repair install of Windows (in-place upgrade keeping apps and files)'
+    } else {
+        $line = ($dismOut -split "`r?`n" | Where-Object { $_ -match 'Error|corrupt' } | Select-Object -First 1)
+        Add-Finding Info 'Component store' "DISM /CheckHealth gave no clear result. $line"
+    }
+} else { Add-Finding Info 'Component store' 'Component store health not checked (DISM needs an elevated session).' 'Re-run as administrator to include it' }
+
+# Servicing operations waiting for a reboot. pending.xml older than the last boot means one got stuck.
+$pendingXml = Join-Path $env:WINDIR 'WinSxS\pending.xml'
+if (Test-Path $pendingXml) {
+    $bootTime = $null
+    try { $bootTime = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime } catch { }
+    $pxTime = (Get-Item $pendingXml -Force).LastWriteTime
+    if ($bootTime -and $pxTime -lt $bootTime) {
+        Add-Finding Problem 'Component store' ("{0} is from {1:g}, before the last boot ({2:g}). An update's install got stuck across a reboot, and later updates (including .NET ones) can keep failing." -f $pendingXml, $pxTime, $bootTime) 'Reboot once more; if it stays, run -Repair, then check C:\Windows\Logs\CBS\CBS.log'
+    } else {
+        Add-Finding Warn 'Component store' ("Servicing operations are waiting for a reboot ({0}, {1:g})." -f $pendingXml, $pxTime) 'Reboot to finish installing updates'
+    }
+}
+
+# CBS log: real errors (level "Error"), plus corruption found by SFC/DISM, in the last 30 days.
+$cbsLog = Join-Path $env:WINDIR 'Logs\CBS\CBS.log'
+$cbsErrors = @(); $cbsCorrupt = @()
+try {
+    $fs = [IO.File]::Open($cbsLog, 'Open', 'Read', 'ReadWrite')
+    try {
+        $max = 16MB
+        if ($fs.Length -gt $max) { [void]$fs.Seek(-$max, 'End') }
+        $sr = New-Object IO.StreamReader($fs)
+        $cbsText = $sr.ReadToEnd()
+    } finally { $fs.Close() }
+    $cbsSince = (Get-Date).AddDays(-30).ToString('yyyy-MM-dd')
+    foreach ($ln in ($cbsText -split "`r?`n")) {
+        if ($ln -notmatch '^\d{4}-\d\d-\d\d ' -or $ln.Substring(0, 10) -lt $cbsSince) { continue }
+        if ($ln -match '^(\S+ \S+), Error\s+(\w+)\s+(.*)$') { $cbsErrors += [pscustomobject]@{ Time = $Matches[1]; Text = $Matches[3].Trim() } }
+        elseif ($ln -match 'Corrupt|cannot repair|Repair failed') { $cbsCorrupt += $ln }
+    }
+} catch { }
+if ($cbsErrors.Count) {
+    $byCode = $cbsErrors | Group-Object { if ($_.Text -match 'HRESULT = (0x[0-9a-fA-F]{8})') { $Matches[1].ToLower() } else { 'other' } } | Sort-Object Count -Descending
+    foreach ($g in ($byCode | Select-Object -First 3)) {
+        $l = $g.Group | Select-Object -Last 1
+        $txt = if ($l.Text.Length -gt 160) { $l.Text.Substring(0, 160) + '...' } else { $l.Text }
+        $hint = if ($g.Name -ne 'other') { Get-WUHint $g.Name } else { 'Run with -Repair (DISM + SFC); if it keeps happening, look up the error text' }
+        Add-Finding Warn 'Component store' ("CBS.log: {0} servicing error(s) ({1}) in 30 days, last {2}: {3}" -f $g.Count, $g.Name, $l.Time, $txt) $hint
+    }
+}
+if ($cbsCorrupt.Count) {
+    $l = $cbsCorrupt | Select-Object -Last 1
+    $txt = if ($l.Length -gt 200) { $l.Substring(0, 200) + '...' } else { $l }
+    Add-Finding Warn 'Component store' "CBS.log reports corruption $($cbsCorrupt.Count)x in 30 days, last: $txt" 'Run with -Repair (DISM /RestoreHealth + SFC)'
+}
+if (-not $cbsErrors.Count -and -not $cbsCorrupt.Count -and (Test-Path $cbsLog)) { Add-Finding OK 'Component store' 'No servicing errors in CBS.log in 30 days.' }
+
+# ---------------------------------------------------------------- 19. temp folders and disk space
+Write-Section '19. Temp folders and disk space'
+# GetTempPath() reads TMP first, then TEMP. Windows\Temp is what services use.
+$tempDirs = [ordered]@{}
+foreach ($vn in 'TMP', 'TEMP') {
+    $val = [Environment]::GetEnvironmentVariable($vn)
+    if ($val -and -not ($tempDirs.Values -contains $val)) { $tempDirs["%$vn%"] = $val }
+}
+$tempDirs['Windows\Temp'] = Join-Path $env:WINDIR 'Temp'
+foreach ($label in $tempDirs.Keys) {
+    $dir = $tempDirs[$label]
+    if (-not (Test-Path $dir)) {
+        Add-Finding Problem 'Temp' "$label points to $dir, which doesn't exist. .NET calls that create temp files (XmlSerializer, WPF, installers) fail." 'Manual: create the folder or fix the variable (System Properties > Environment Variables)'
+        continue
+    }
+    try {
+        # GetTempFileName() names files tmpXXXX.tmp: 65,535 names, then it fails with "The file exists".
+        $tmpCount = 0; $allCount = 0
+        foreach ($f in [IO.Directory]::EnumerateFiles($dir, 'tmp*.tmp')) { $tmpCount++ }
+        foreach ($f in [IO.Directory]::EnumerateFiles($dir)) { $allCount++ }
+        if ($tmpCount -ge 60000) {
+            Add-Finding Problem 'Temp' ("{0} ({1}) holds {2:N0} tmp*.tmp files. At 65,535, Path.GetTempFileName() fails with an IOException in every .NET app." -f $label, $dir, $tmpCount) 'Manual: close apps and delete old files from this folder (Disk Cleanup > Temporary files)'
+        } elseif ($tmpCount -ge 20000 -or $allCount -ge 100000) {
+            Add-Finding Warn 'Temp' ("{0} ({1}) holds {2:N0} files ({3:N0} tmp*.tmp). Something is leaking temp files; at 65,535 tmp*.tmp, .NET temp-file creation fails." -f $label, $dir, $allCount, $tmpCount) 'Manual: delete old files from this folder and find the app that leaves them'
+        } else {
+            Add-Finding OK 'Temp' ("{0} ({1}): {2:N0} files." -f $label, $dir, $allCount)
+        }
+    } catch {
+        if ($_.Exception.GetBaseException() -is [UnauthorizedAccessException]) { Add-Finding Info 'Temp' "$label ($dir) can't be read without admin rights." }
+        else { Add-Finding Warn 'Temp' "$label ($dir) could not be read: $($_.Exception.GetBaseException().Message)" }
+    }
+}
+# Live test: exactly what .NET apps call.
+try {
+    $probeTmp = [IO.Path]::GetTempFileName()
+    Remove-Item $probeTmp -Force -WhatIf:$false -ErrorAction SilentlyContinue
+    Add-Finding OK 'Temp' "Path.GetTempFileName() works ($([IO.Path]::GetTempPath()))."
+} catch {
+    Add-Finding Problem 'Temp' "Path.GetTempFileName() failed: $($_.Exception.Message)" 'Fix the temp folder findings above (full, missing or no write access)'
+}
+# Free space on the system drive and the temp drive(s)
+$drvs = @($env:SystemDrive) + @($tempDirs.Values | ForEach-Object { if ($_ -match '^([A-Za-z]:)') { $Matches[1].ToUpper() } }) | Select-Object -Unique
+foreach ($dl in $drvs) {
+    $ld = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$dl'" -ErrorAction SilentlyContinue
+    if (-not $ld -or -not $ld.Size) { continue }
+    $freeGB = [math]::Round($ld.FreeSpace / 1GB, 1)
+    $isSys = $dl -eq $env:SystemDrive
+    if ($freeGB -lt 2) {
+        Add-Finding Problem 'Disk space' "$dl has only $freeGB GB free. Apps, temp files, NGen and updates fail when the disk fills up." 'Free up space (Disk Cleanup, Storage Sense)'
+    } elseif ($isSys -and $freeGB -lt 10) {
+        Add-Finding Warn 'Disk space' "$dl (system drive) has $freeGB GB free. Cumulative and .NET updates can fail with less than ~10 GB." 'Free up space before installing updates'
+    } else { Add-Finding OK 'Disk space' "$dl has $freeGB GB free." }
+}
+
+# ---------------------------------------------------------------- 20. injected modules
+Write-Section '20. Third-party DLLs injected into .NET apps'
+$secVendors = 'CrowdStrike|SentinelOne|Sentinel Labs|Symantec|Broadcom|McAfee|Trellix|Sophos|ESET|Kaspersky|Bitdefender|Trend Micro|Carbon Black|VMware|Cylance|BlackBerry|Palo Alto|Cisco|Malwarebytes|Avast|AVG|Norton|Gen Digital|Webroot|OpenText|F-Secure|WithSecure|Check Point|Fortinet|Elastic|Tanium|Ivanti|BeyondTrust|CyberArk|Avecto|Digital Guardian|Forcepoint|Zscaler|Netskope|Cybereason|Huntress|Deep Instinct|Morphisec|ThreatLocker|Airlock|Varonis|Rapid7|Qualys'
+$hookVendors = 'NVIDIA|Advanced Micro|AMD|Intel|RivaTuner|Unwinder|Overwolf|Discord|Valve|Razer|Logitech|SteelSeries|Corsair|Nahimic|A-Volute|Micro-Star|ASUS|Realtek|Dolby|Waves|NZXT|Elgato|OBS|Medal|Rewind'
+if ($netProcs.Count) {
+    $injRows = @(foreach ($np in $netProcs) { foreach ($f in @($np.Foreign)) { [pscustomobject]@{ File = $f; App = $np.Name } } })
+    # Something in two or more different apps, from outside their folders, is being injected (or is a shell extension).
+    # Files that ship with Windows (catalog-signed "Microsoft Windows") don't count, even without a Microsoft company name (icu.dll).
+    $winSigned = @{}
+    function Test-WindowsSigned([string]$FilePath) {
+        if (-not $winSigned.ContainsKey($FilePath)) {
+            $subj = ''
+            try { $sig = Get-AuthenticodeSignature -FilePath $FilePath -ErrorAction Stop; if ($sig.SignerCertificate) { $subj = $sig.SignerCertificate.Subject } } catch { }
+            $winSigned[$FilePath] = $subj -match '^CN=Microsoft (Windows|Corporation)(,|$)'
+        }
+        $winSigned[$FilePath]
+    }
+    $injected = @($injRows | Group-Object File | Where-Object { @($_.Group | ForEach-Object App | Sort-Object -Unique).Count -ge 2 } |
+        Where-Object { -not (Test-WindowsSigned $_.Name) } |
+        Sort-Object { @($_.Group | ForEach-Object App | Sort-Object -Unique).Count } -Descending)
+    # Crashes in the last 30 days whose faulting module is one of them
+    $crashMods = @{}
+    foreach ($e in @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue)) {
+        if ($e.Properties.Count -lt 4) { continue }
+        $mn = "$($e.Properties[3].Value)".ToLower()
+        if (-not $crashMods.ContainsKey($mn)) { $crashMods[$mn] = New-Object System.Collections.Generic.List[string] }
+        $crashMods[$mn].Add("$($e.Properties[0].Value)")
+    }
+    $shown = 0
+    foreach ($g in $injected) {
+        $apps = @($g.Group | ForEach-Object App | Sort-Object -Unique)
+        $co = Get-FileCompany $g.Name
+        $kind = if ($co -match $secVendors) { ', security software' } elseif ($co -match $hookVendors) { ', hardware/overlay utility' } else { '' }
+        $coTxt = if ($co) { "$co$kind" } else { "no company name$kind" }
+        $leaf = (Split-Path $g.Name -Leaf).ToLower()
+        $appList = if ($apps.Count -gt 4) { (($apps | Select-Object -First 4) -join ', ') + ", +$($apps.Count - 4) more" } else { $apps -join ', ' }
+        if ($crashMods.ContainsKey($leaf)) {
+            $crashApps = ($crashMods[$leaf] | Sort-Object -Unique | Select-Object -First 4) -join ', '
+            Add-Finding Warn 'Injected DLL' ("{0} ({1}) is loaded into {2} .NET apps ({3}), and apps crashed inside it {4}x in 30 days ({5})." -f $g.Name, $coTxt, $apps.Count, $appList, $crashMods[$leaf].Count, $crashApps) 'Update or temporarily disable that product (or exclude the app from it) and see if the crashes stop'
+        } elseif ($shown -lt 10) {
+            Add-Finding Info 'Injected DLL' ("{0} ({1}) is loaded into {2} .NET apps: {3}" -f $g.Name, $coTxt, $apps.Count, $appList)
+            $shown++
+        }
+    }
+    if ($injected.Count -gt $shown -and $shown -ge 10) { Add-Finding Info 'Injected DLL' "$($injected.Count - $shown) more shared third-party DLL(s) not shown." }
+    if (-not $injected.Count) { Add-Finding OK 'Injected DLL' 'No third-party DLL is loaded into more than one running .NET app from outside its folder.' }
+    else { Add-Finding Info 'Injected DLL' 'Security, overlay and shell-extension DLLs load into many apps by design. They matter when the failing app crashes, hangs or leaks inside one of them: compare with the crash module in section 11.' }
+} else { Add-Finding Info 'Injected DLL' 'No .NET processes visible right now (run while the failing app is open).' }
 
 # ---------------------------------------------------------------- repair
 if ($Repair) {

@@ -67,6 +67,12 @@ version and build, hardware, CPU, RAM, PowerShell host, locale, time zone), then
 | 12 | NGen native images | .NET Framework native image cache size, NGen service state, optimization-service errors |
 | 13 | Windows Update | Failed .NET updates (Windows Update history and Setup log) with hints for common error codes; pending reboot; whether .NET 5+ is updated through Microsoft Update; optionally, .NET updates not yet installed |
 | 14 | Visual C++ Redistributables | Installed versions (x86/x64); **orphaned registrations that stop VC++ from being upgraded** (cached installer or MSI missing, Programs and Features entries Windows Installer doesn't know about and the reverse, stale dependency records, duplicate v14 entries); whether the v14 installer, runtime packages, registry and DLL versions agree; missing x86 runtime while 32-bit .NET apps run; failed `VC_redist` installs (installer logs and Windows Installer events); crashes inside the C++ runtime DLLs |
+| 15 | Application control | Smart App Control state; enforced WDAC policies (admin); Code Integrity, AppLocker and Defender Attack Surface Reduction blocks that hit .NET apps or the runtime; Defender detections in `.exe`/`.dll` files (a quarantined DLL looks like a missing file) |
+| 16 | TLS and cryptography | `SchUseStrongCrypto` / `SystemDefaultTlsVersions` for .NET Framework 4.x (and 2.0/3.5 if installed); TLS versions turned off in SCHANNEL; FIPS mode; Schannel credential errors |
+| 17 | .NET 5+ host resolution | Causes of "You must install or update .NET" when .NET is installed: missing `hostfxr.dll`, a wrong registered install location, the 32-bit `dotnet.exe` first on PATH, `DOTNET_ROOT*` pointing nowhere or at the wrong bitness, roll-forward overrides; apps that logged ".NET not found" start failures |
+| 18 | Component store and .NET 3.5 | .NET Framework 3.5 feature state (including half-installed); `DISM /CheckHealth` (admin); a `pending.xml` stuck since before the last boot; servicing errors and corruption in `CBS.log` |
+| 19 | Temp folders and disk space | `TMP`/`TEMP` pointing at a missing folder; temp folders close to the 65,535 `tmp*.tmp` limit where `Path.GetTempFileName()` fails; a live `GetTempFileName()` test; low free space on the system and temp drives |
+| 20 | Injected DLLs | Third-party DLLs (security, overlay, hardware and shell-extension software) loaded into two or more running .NET apps from outside their folders, flagged when apps have crashed inside them |
 
 Each finding is tagged:
 
@@ -101,6 +107,23 @@ them.
 | `-OutputDirectory <path>` | Where to save the console log and CSV report. Default: the script's folder. |
 | `-BackupRoot <path>` | Where `-Fix` saves backups. Default: `%USERPROFILE%\DotNetTroubleshooter-Backups`. |
 
+### `-Fix` vs `-Repair`
+
+They do different jobs and can be combined (`-Fix -Repair`). Both need admin.
+
+| | `-Fix` | `-Repair` |
+|---|---|---|
+| What it does | Undoes specific settings the diagnosis flagged (listed below) | Repairs Windows system files: `DISM /Online /Cleanup-Image /RestoreHealth`, then `sfc /scannow` |
+| When it acts | Only on findings marked `Fix:`. On a healthy machine it changes nothing | Always runs, whatever the diagnosis found |
+| Safety net | Restore point and registry backups first; supports `-WhatIf` | No backup or `-WhatIf` (it only replaces damaged files with clean copies from Microsoft) |
+| Time | Seconds; some changes need a reboot | Usually 15–45 minutes |
+| Doesn't cover | Anything marked `Manual:` | .NET 5+ runtimes and Visual C++ Redistributables (reinstall those instead) |
+
+Use `-Repair` when the report shows component store corruption (check 18), failed .NET Framework
+updates (check 13), or a missing or broken .NET Framework install (check 3). Use `-Fix` for the
+settings findings. If DISM can't download repair files (0x800f081f / 0x800f0906, common with
+WSUS), the check 18 finding explains how to repair from a Windows ISO instead.
+
 ### What `-Fix` changes
 
 Before its first change, `-Fix` tries to create a System Restore point and saves backups of
@@ -113,17 +136,22 @@ registry keys and settings to `<BackupRoot>\<timestamp>`. It only changes what t
 - Restores lowered GDI/USER handle quotas to 10000 *(reboot)*
 - Restores a corrupt `machine.config`/`web.config` from its `.default` copy, if one exists
 - Runs `ngen executeQueuedItems` and `ngen update` for 32-bit and 64-bit (these do nothing when the cache is healthy)
+- Sets `SchUseStrongCrypto=1` and `SystemDefaultTlsVersions=1` under the .NET Framework keys when
+  they are missing or 0 (Microsoft's recommended setting; restart the apps afterwards)
 
-Profilers, `AppInit_DLLs`, 32-bit apps, failed Windows updates, `runtimeconfig.json` settings and
-Visual C++ Redistributable problems (including orphaned entries) are reported only. Each orphan
-finding names the exact registry path involved. Those belong to other products or need a human decision.
+Profilers, `AppInit_DLLs`, 32-bit apps, failed Windows updates, `runtimeconfig.json` settings,
+Visual C++ Redistributable problems (including orphaned entries), application control policies,
+SCHANNEL/FIPS settings, .NET 5+ install locations, temp folders and injected DLLs are reported
+only. Each orphan finding names the exact registry path involved. Those belong to other products,
+to whoever manages the machine, or need a human decision.
 
 ## Testing status
 
 The report-only diagnosis has been run on Windows 11 under both Windows PowerShell 5.1 and
 PowerShell 7. The crash-event parsing was checked against a deliberately crashed test app. The
 Visual C++ orphan checks and installer-log parsing were checked against simulated orphaned entries
-and fake failed installer logs, not against a real broken machine.
+and fake failed installer logs, not against a real broken machine. Check 17 was checked with fake
+`DOTNET_ROOT` variables, and check 20 with a third-party DLL loaded into two .NET processes.
 
 **Never run on a real system:**
 
@@ -132,6 +160,9 @@ and fake failed installer logs, not against a real broken machine.
 - Most `FAIL` paths, because the test machines didn't have those problems: a process near its
   handle limit, kernel handle leaks, handle growth, a `HeapHardLimit` setting, a currently failing
   .NET update, Setup log install failures
+- Checks 15–20 against real blocks or failures: Code Integrity/AppLocker/ASR blocks, disabled TLS
+  1.2, FIPS mode, a missing `hostfxr.dll`, component store corruption, a full temp folder, and
+  crashes inside an injected DLL
 
 If you use it and something is wrong, the CSV report and the console output are the most useful
 things to share.
