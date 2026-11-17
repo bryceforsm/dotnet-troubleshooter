@@ -60,6 +60,7 @@ param(
     [switch]$Fix,
     [switch]$Repair,
     [string]$BackupRoot = (Join-Path $env:USERPROFILE 'DotNetTroubleshooter-Backups'),
+    [string]$OutputDirectory = '',   # console log + CSV report; default: the script's own folder
     [switch]$SkipAllocationTest,
     [ValidateRange(0, 3600)]
     [int]$HandleSampleSeconds = 0,
@@ -95,6 +96,27 @@ $stamp      = Get-Date -Format 'yyyyMMdd-HHmmss'
 $BackupDir  = Join-Path $BackupRoot $stamp
 $script:BackupReady = $false
 $script:NeedsReboot = $false
+
+# ---------------------------------------------------------------- output files (console log + CSV report)
+# Written even under -WhatIf: they are the script's own output, not system changes.
+if (-not $OutputDirectory) { $OutputDirectory = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path } }
+try {
+    if (-not (Test-Path $OutputDirectory)) { New-Item -ItemType Directory -Path $OutputDirectory -Force -WhatIf:$false -ErrorAction Stop | Out-Null }
+    $probe = Join-Path $OutputDirectory ".write-test-$stamp"
+    [IO.File]::WriteAllText($probe, '')
+    Remove-Item $probe -Force -WhatIf:$false
+} catch {
+    Write-Warning "Cannot write to $OutputDirectory ($($_.Exception.Message)). Saving the console log and report to $env:TEMP instead."
+    $OutputDirectory = $env:TEMP
+}
+$LogPath = Join-Path $OutputDirectory "DotNetTroubleshooter-console-$stamp.log"
+$script:Transcribing = $false
+try {
+    Start-Transcript -Path $LogPath -WhatIf:$false -ErrorAction Stop | Out-Null
+    $script:Transcribing = $true
+} catch { Write-Warning "Console log will not be saved: $($_.Exception.Message)" }
+# Stop the transcript if the script dies, so it doesn't keep recording the user's session.
+trap { if ($script:Transcribing) { try { Stop-Transcript | Out-Null } catch { } }; break }
 
 function Initialize-Backup {
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -1159,6 +1181,17 @@ if ($script:BackupReady) { Write-Host "Backups saved in: $BackupDir" -Foreground
 if ($script:NeedsReboot) { Write-Host 'A REBOOT is required for some fixes to take effect.' -ForegroundColor Yellow }
 if (-not $Fix -and ($problems | Where-Object Action -like 'Fix:*')) { Write-Host 'Re-run elevated with -Fix to apply the fixes marked "Fix:".' -ForegroundColor Cyan }
 
-$report = Join-Path $env:TEMP "DotNetTroubleshooter-report-$stamp.csv"
-$script:Findings | Export-Csv $report -NoTypeInformation
+$report = Join-Path $OutputDirectory "DotNetTroubleshooter-report-$stamp.csv"
+$script:Findings | Export-Csv $report -NoTypeInformation -WhatIf:$false
 Write-Host "Full report: $report"
+if ($script:Transcribing) {
+    Write-Host "Console log: $LogPath"
+    Stop-Transcript | Out-Null
+    # The colored tag is written with -NoNewline, which the transcript records as its own line.
+    # Rejoin "  [ OK ]" + "message" into one line so the log reads like the console.
+    try {
+        $logText = [IO.File]::ReadAllText($LogPath)
+        $logText = [regex]::Replace($logText, '(?m)^(\s*\[(?: OK |INFO|WARN|FAIL)\])[ \t]*\r?\n', '$1 ')
+        [IO.File]::WriteAllText($LogPath, $logText, (New-Object Text.UTF8Encoding $true))
+    } catch { }
+}

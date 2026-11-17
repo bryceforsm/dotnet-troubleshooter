@@ -78,8 +78,14 @@ Each finding is tagged:
          -> Suggested next step
 ```
 
-A summary of all `WARN` and `FAIL` findings is printed at the end, and every finding is saved to
-`%TEMP%\DotNetTroubleshooter-report-<timestamp>.csv`.
+A summary of all `WARN` and `FAIL` findings is printed at the end. Each run also saves two files
+in the script's folder (or the folder given with `-OutputDirectory`):
+
+- `DotNetTroubleshooter-console-<timestamp>.log`: everything printed to the console
+- `DotNetTroubleshooter-report-<timestamp>.csv`: every finding, one row each
+
+If the folder can't be written to, both go to `%TEMP%` instead. The repo's `.gitignore` excludes
+them.
 
 ## Parameters
 
@@ -92,6 +98,7 @@ A summary of all `WARN` and `FAIL` findings is printed at the end, and every fin
 | `-HandleSampleSeconds <n>` | Takes a second handle sample after `n` seconds (1–3600) and reports processes whose handle counts grew. |
 | `-CheckAvailableUpdates` | Searches Windows Update online for applicable .NET updates that aren't installed. Can take a few minutes. |
 | `-SkipAllocationTest` | Skips check 10. |
+| `-OutputDirectory <path>` | Where to save the console log and CSV report. Default: the script's folder. |
 | `-BackupRoot <path>` | Where `-Fix` saves backups. Default: `%USERPROFILE%\DotNetTroubleshooter-Backups`. |
 
 ### What `-Fix` changes
@@ -144,7 +151,7 @@ things to share.
 
 ## Privacy
 
-The console output and the CSV report include the computer name, user name, installed software
+The console output, console log and CSV report include the computer name, user name, installed software
 and process names. Review them before posting them publicly.
 
 ## Disclaimer

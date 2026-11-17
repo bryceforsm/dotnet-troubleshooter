@@ -1,0 +1,3 @@
+# Output written next to the script by Invoke-DotNetTroubleshooter.ps1
+DotNetTroubleshooter-console-*.log
+DotNetTroubleshooter-report-*.csv
