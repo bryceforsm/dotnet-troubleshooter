@@ -30,6 +30,10 @@
      13. Windows Update                 - failed .NET updates (WU history + Setup log) with error-code hints,
                                            pending reboot, whether .NET 5+ is updated via Microsoft Update,
                                            and (with -CheckAvailableUpdates) .NET updates not yet installed
+     14. Visual C++ Redistributables    - installed versions; orphaned registrations that block upgrades
+                                           (missing cached installers/MSIs, stale Programs and Features or
+                                           dependency entries, duplicate v14 entries); v14 version consistency;
+                                           failed VC_redist installs; crashes inside the C++ runtime DLLs
 
     Default is report-only. Use -Fix to apply safe fixes (backups + restore point first).
     Use -Repair to also run DISM /RestoreHealth and SFC to repair .NET Framework system files.
@@ -488,9 +492,11 @@ $netProcs = foreach ($p in Get-Process) {
             }
         } else { "Framework $(Get-ModuleVersion $clr)" }
         $desktop = [bool]($mods | Where-Object { $_.ModuleName -in 'PresentationFramework.dll', 'System.Windows.Forms.dll', 'wpfgfx_cor3.dll', 'wpfgfx_v0400.dll' })
+        # Visual C++ runtimes loaded (vcruntime140 -> 14, msvcr120 -> 12, ...); app-local copies like vcruntime140_cor3 are ignored
+        $vcrt = (@($mods | ForEach-Object { if ($_.ModuleName -match '^(?:vcruntime|msvcr)(\d{2,3})\.dll$') { [int]$Matches[1] / 10 } }) | Sort-Object -Unique) -join ','
         $wow = $false; [void][OomNative]::IsWow64Process($p.Handle, [ref]$wow)
         [pscustomobject]@{
-            Name = $p.Name; Id = $p.Id; Bits = $(if ($wow) { 32 } else { 64 }); Runtime = $runtime; GUI = $desktop
+            Name = $p.Name; Id = $p.Id; Bits = $(if ($wow) { 32 } else { 64 }); Runtime = $runtime; GUI = $desktop; VCRT = $vcrt
             PrivateGB = [math]::Round($p.PrivateMemorySize64 / 1GB, 2); VirtualGB = [math]::Round($p.VirtualMemorySize64 / 1GB, 2)
             Path = $p.Path; IsCore = [bool]$core
         }
@@ -498,7 +504,7 @@ $netProcs = foreach ($p in Get-Process) {
 }
 $netProcs = @($netProcs)
 if ($netProcs.Count) {
-    $netProcs | Sort-Object Bits, PrivateGB -Descending | Format-Table Name, Id, Bits, Runtime, GUI, PrivateGB, VirtualGB -AutoSize | Out-Host
+    $netProcs | Sort-Object Bits, PrivateGB -Descending | Format-Table Name, Id, Bits, Runtime, GUI, VCRT, PrivateGB, VirtualGB -AutoSize | Out-Host
     foreach ($np in ($netProcs | Where-Object { $_.Bits -eq 32 -and ($_.VirtualGB -gt 1.6 -or $_.PrivateGB -gt 1.2) })) {
         Add-Finding Problem '32-bit limit' "$($np.Name) (PID $($np.Id), $($np.Runtime)) is a 32-bit .NET process using $($np.VirtualGB) GB virtual / $($np.PrivateGB) GB private. 32-bit apps hit OOM at ~1.5-2 GB no matter how much RAM you have." 'Use the app''s 64-bit build, or ask the vendor to enable /LARGEADDRESSAWARE'
     }
@@ -578,6 +584,7 @@ function Get-CrashHint([string]$What) {
     switch -Regex ($What) {
         'OutOfMemory|InsufficientMemory|8007000E'                    { 'Memory/handles: see sections 1, 5, 6 and 8'; break }
         'BadImageFormat'                                             { '32/64-bit mismatch or corrupt native image: see sections 8 and 12'; break }
+        'DllNotFound|8007007E'                                       { 'A native DLL is missing - often the Visual C++ Redistributable (matching x86/x64) or a vendor component: see section 14'; break }
         'FileNotFound|FileLoad|TypeLoad|MissingMethod|MissingField'  { 'Missing or mismatched assembly/runtime: see section 3; reinstall the app or its runtime'; break }
         'ConfigurationErrors|TypeInitialization'                     { 'Configuration problem: see section 7 and the app''s .config / runtimeconfig.json'; break }
         'profiler'                                                   { 'A CLR profiler failed to load: see section 2'; break }
@@ -843,6 +850,254 @@ if ($CheckAvailableUpdates) {
         } else { Add-Finding OK 'Updates' 'No applicable .NET updates waiting to be installed.' }
     } catch { Add-Finding Info 'Updates' "Online update search failed: $($_.Exception.Message)" }
 } else { Add-Finding Info 'Updates' 'Available-update search skipped (use -CheckAvailableUpdates; contacts Windows Update online).' }
+
+# ---------------------------------------------------------------- 14. Visual C++ Redistributables
+Write-Section '14. Visual C++ Redistributables (native dependency of many .NET apps)'
+$vcSince = (Get-Date).AddDays(-90)
+function Get-Prop($Obj, [string]$Name) { $p = $Obj.PSObject.Properties[$Name]; if ($p) { $p.Value } else { $null } }
+function ConvertTo-Ver3($Text) { if ("$Text" -match '(\d+)\.(\d+)\.(\d+)') { '{0}.{1}.{2}' -f $Matches[1], $Matches[2], $Matches[3] } else { $null } }
+$guidPattern = '^\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}$'
+$orphanHelp  = 'Use Microsoft''s "Program Install and Uninstall" troubleshooter, or back up and delete the stale registry entry'
+
+# --- Programs and Features entries (both registry views)
+$uninstRoots = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+$allArpKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$vcArp = @(foreach ($root in $uninstRoots) {
+    if (-not (Test-Path $root)) { continue }
+    foreach ($k in Get-ChildItem $root -ErrorAction SilentlyContinue) {
+        [void]$allArpKeys.Add($k.PSChildName)
+        $p = Get-ItemProperty $k.PSPath -ErrorAction SilentlyContinue
+        if (-not $p) { continue }
+        $dn = "$(Get-Prop $p 'DisplayName')"
+        if ($dn -notmatch 'Visual C\+\+.*(Redistributable|Runtime)') { continue }
+        $arch = if ($dn -match '\b(x64|amd64)\b') { 'x64' } elseif ($dn -match '\bx86\b') { 'x86' } elseif ($dn -match 'arm64') { 'arm64' } else { '?' }
+        $cache = Get-Prop $p 'BundleCachePath'
+        [pscustomobject]@{
+            Name = $dn; Version = "$(Get-Prop $p 'DisplayVersion')"; Arch = $arch; Key = $k.PSChildName; RegPath = $k.Name
+            IsBundle = [bool]($cache -or (Get-Prop $p 'BundleProviderKey')); BundleCache = $cache
+            IsMsi = ((Get-Prop $p 'WindowsInstaller') -eq 1); IsSystem = ((Get-Prop $p 'SystemComponent') -eq 1)
+        }
+    }
+})
+
+# --- Windows Installer's own records
+$wiOk = $false; $wiProducts = @{}; $wi = $null; $wiType = $null
+try {
+    $wi = New-Object -ComObject WindowsInstaller.Installer
+    $wiType = $wi.GetType()
+    foreach ($code in $wiType.InvokeMember('Products', 'GetProperty', $null, $wi, $null)) {
+        $name = "$($wiType.InvokeMember('ProductInfo', 'GetProperty', $null, $wi, @($code, 'ProductName')))"
+        if ($name -notmatch 'Visual C\+\+') { continue }
+        $lp = $(try { $wiType.InvokeMember('ProductInfo', 'GetProperty', $null, $wi, @($code, 'LocalPackage')) } catch { $null })
+        $wiProducts[$code.ToUpper()] = [pscustomobject]@{ Code = $code; Name = $name; LocalPackage = $lp }
+    }
+    $wiOk = $true
+} catch { Add-Finding Info 'VC++' "Could not query Windows Installer, so orphan checks are partial: $($_.Exception.Message)" }
+
+# --- inventory (top-level entries only; the Minimum/Additional runtime parts are hidden in Programs and Features)
+foreach ($a in 'x64', 'x86', 'arm64') {
+    $top = @($vcArp | Where-Object { $_.Arch -eq $a -and -not $_.IsSystem } | Sort-Object { [version](ConvertTo-Ver3 $_.Version) })
+    if (-not $top.Count) { continue }
+    $parts = foreach ($t in $top) {
+        $label = if ($t.Name -match '(20\d\d(?:-20\d\d)?)') { $Matches[1] } elseif ($t.Version -like '14.*') { 'v14' } else { '?' }
+        "$label ($($t.Version))"
+    }
+    Add-Finding Info 'VC++' ("{0}: {1}" -f $a, ($parts -join ', '))
+}
+if (-not $vcArp.Count) { Add-Finding Info 'VC++' 'No Visual C++ Redistributables are installed.' }
+
+$vcProblems = 0
+# --- orphan 1: installer entries whose cached installer is gone
+foreach ($b in ($vcArp | Where-Object { $_.IsBundle -and $_.BundleCache })) {
+    if (-not (Test-Path $b.BundleCache)) {
+        $vcProblems++
+        Add-Finding Problem 'VC++ orphan' "$($b.Name): its cached installer is missing ($($b.BundleCache)), so it can't be repaired, uninstalled or cleanly upgraded. This is a common reason VC++ upgrades fail." "Run the SAME version's VC_redist installer with /repair to re-cache it. Otherwise: $orphanHelp ($($b.RegPath))"
+    }
+}
+if ($wiOk) {
+    # --- orphan 2: Windows Installer products whose cached MSI is gone, or with no Programs and Features entry
+    foreach ($wp in $wiProducts.Values) {
+        if (-not $wp.LocalPackage -or -not (Test-Path $wp.LocalPackage)) {
+            $vcProblems++
+            Add-Finding Problem 'VC++ orphan' "$($wp.Name) $($wp.Code): its cached MSI is missing ($(if ($wp.LocalPackage) { $wp.LocalPackage } else { 'not recorded' })). Upgrading or removing it fails with error 1612 or 1714." "Repair it with the exact same version's installer, or use Microsoft's ""Program Install and Uninstall"" troubleshooter to remove it"
+        }
+        if (-not $allArpKeys.Contains($wp.Code)) {
+            $vcProblems++
+            Add-Finding Warn 'VC++ orphan' "$($wp.Name) $($wp.Code) is registered with Windows Installer but has no Programs and Features entry, so it can't be removed normally." "msiexec /x $($wp.Code)  (or the Program Install and Uninstall troubleshooter)"
+        }
+    }
+    # --- orphan 3: Programs and Features entries Windows Installer doesn't know about
+    foreach ($m in ($vcArp | Where-Object { $_.IsMsi -and $_.Key -match $guidPattern })) {
+        if ($wiProducts.ContainsKey($m.Key.ToUpper())) { continue }
+        $state = $(try { [int]$wiType.InvokeMember('ProductState', 'GetProperty', $null, $wi, @($m.Key)) } catch { -1 })
+        if ($state -ne 5) {
+            $vcProblems++
+            Add-Finding Problem 'VC++ orphan' "$($m.Name) is listed in Programs and Features but Windows Installer has no record of it (state $state). Installers can skip or fail on this stale entry." "${orphanHelp}: $($m.RegPath)"
+        }
+    }
+}
+# --- orphan 4: dependency records that point at installers which no longer exist
+$depRoot = 'HKLM:\SOFTWARE\Classes\Installer\Dependencies'
+if (Test-Path $depRoot) {
+    foreach ($dk in Get-ChildItem $depRoot -ErrorAction SilentlyContinue) {
+        $dp = Get-ItemProperty $dk.PSPath -ErrorAction SilentlyContinue
+        $ddn = "$(Get-Prop $dp 'DisplayName')"
+        if ($dk.PSChildName -notmatch 'VC_Runtime|^VC,redist' -and $ddn -notmatch 'Visual C\+\+') { continue }
+        foreach ($dep in @(Get-ChildItem (Join-Path $dk.PSPath 'Dependents') -ErrorAction SilentlyContinue)) {
+            $id = $dep.PSChildName
+            if ($id -notmatch $guidPattern) { continue }
+            if ($allArpKeys.Contains($id) -or $wiProducts.ContainsKey($id.ToUpper())) { continue }
+            $vcProblems++
+            $label = if ($ddn) { $ddn } else { $dk.PSChildName }
+            Add-Finding Warn 'VC++ orphan' "$label is still marked as needed by $id, which is no longer installed. Stale dependency records can block uninstalling or upgrading it." "${orphanHelp}: $($dep.Name)"
+        }
+    }
+}
+
+# --- v14 (2015-2022) consistency per architecture
+$sys64 = if ([Environment]::Is64BitProcess -or -not [Environment]::Is64BitOperatingSystem) { Join-Path $env:WINDIR 'System32' } else { Join-Path $env:WINDIR 'Sysnative' }
+$sys32 = if ([Environment]::Is64BitOperatingSystem) { Join-Path $env:WINDIR 'SysWOW64' } else { Join-Path $env:WINDIR 'System32' }
+$v14Missing = @()
+$archList = @('x86'); if ([Environment]::Is64BitOperatingSystem) { $archList = @('x64', 'x86') }
+if ($vcArp | Where-Object { $_.Arch -eq 'arm64' }) { $archList += 'arm64' }
+foreach ($a in $archList) {
+    $bundles = @($vcArp | Where-Object { $_.Arch -eq $a -and $_.IsBundle -and $_.Version -like '14.*' })
+    $minimum = @($vcArp | Where-Object { $_.Arch -eq $a -and $_.Name -match 'Minimum Runtime' -and $_.Version -like '14.*' })
+    $addl    = @($vcArp | Where-Object { $_.Arch -eq $a -and $_.Name -match 'Additional Runtime' -and $_.Version -like '14.*' })
+    $regVer = $null
+    foreach ($rk in "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\$a", "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\$a") {
+        if (-not $regVer) { $regVer = ConvertTo-Ver3 (Get-RegValue $rk 'Version') }
+    }
+    $dllDir  = switch ($a) { 'x86' { $sys32 } default { $sys64 } }
+    $dllPath = Join-Path $dllDir 'vcruntime140.dll'
+    $dllVer  = if ($a -ne 'arm64' -and (Test-Path $dllPath)) { ConvertTo-Ver3 (Get-Item $dllPath).VersionInfo.FileVersion } else { $null }
+
+    if (-not ($bundles.Count -or $minimum.Count -or $regVer)) {
+        $v14Missing += $a
+        Add-Finding Info 'VC++ v14' "$a Visual C++ 2015-2022 (v14) is not installed$(if ($dllVer) { " (but vcruntime140.dll $dllVer is present, probably from another installer)" })."
+        continue
+    }
+    if ($bundles.Count -gt 1) {
+        $vcProblems++
+        Add-Finding Warn 'VC++ orphan' ("{0} v14 has {1} installer entries ({2}). Only one should exist; the older one is orphaned and can make newer installers fail or report 'another version is installed'." -f $a, $bundles.Count, (($bundles | ForEach-Object { $_.Version }) -join ', ')) "${orphanHelp}: $((($bundles | Sort-Object { [version](ConvertTo-Ver3 $_.Version) } | Select-Object -First 1).RegPath))"
+    }
+    if ($bundles.Count -and -not $minimum.Count) {
+        $vcProblems++
+        Add-Finding Problem 'VC++ v14' "$a v14 installer entry exists but its Minimum Runtime package is not installed - the redistributable is broken." "Run the latest VC_redist.$a.exe with /repair"
+    }
+    if (-not $dllVer -and $a -ne 'arm64') {
+        $vcProblems++
+        Add-Finding Problem 'VC++ v14' "$a v14 is registered but $dllPath is missing." "Run the latest VC_redist.$a.exe with /repair"
+    }
+    $verMap = [ordered]@{}
+    if ($bundles.Count) { $verMap['installer'] = ConvertTo-Ver3 ($bundles | Sort-Object { [version](ConvertTo-Ver3 $_.Version) } -Descending | Select-Object -First 1).Version }
+    if ($minimum.Count) { $verMap['Minimum Runtime'] = ConvertTo-Ver3 $minimum[0].Version }
+    if ($addl.Count)    { $verMap['Additional Runtime'] = ConvertTo-Ver3 $addl[0].Version }
+    if ($regVer)        { $verMap['registry'] = $regVer }
+    if ($dllVer)        { $verMap['vcruntime140.dll'] = $dllVer }
+    $distinct = @($verMap.Values | Where-Object { $_ } | Sort-Object -Unique)
+    if ($distinct.Count -gt 1) {
+        $vcProblems++
+        Add-Finding Warn 'VC++ v14' ("{0} v14 versions disagree: {1}. A partial upgrade, rollback, or another installer overwrote files." -f $a, (($verMap.GetEnumerator() | ForEach-Object { "$($_.Key) $($_.Value)" }) -join ', ')) "Run the latest VC_redist.$a.exe with /repair"
+    } else {
+        $note = if (-not $bundles.Count) { ' (no installer entry: it was installed by another product, which is fine)' } else { '' }
+        Add-Finding OK 'VC++ v14' "$a v14 $($distinct[0]): installer, runtime packages, registry and DLLs agree$note."
+    }
+}
+if ($v14Missing -contains 'x86') {
+    $x86Net = @($netProcs | Where-Object { $_.Bits -eq 32 })
+    if ($x86Net.Count) {
+        Add-Finding Warn 'VC++ v14' "32-bit .NET apps are running ($(($x86Net | ForEach-Object Name | Sort-Object -Unique) -join ', ')) but the x86 v14 redistributable is not installed. 32-bit apps need the x86 package even on 64-bit Windows." 'Install VC_redist.x86.exe if one of them reports missing DLLs'
+    }
+}
+
+# --- an install already in progress blocks every other MSI (error 1618)
+if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress') {
+    Add-Finding Warn 'VC++ install' 'A Windows Installer operation is in progress (or was interrupted). Other installs, including VC++, fail with 1618 until it finishes.' 'Wait for it, or reboot'
+}
+
+# --- recent install failures
+$installerHints = @{
+    1601 = 'Windows Installer service unavailable: reboot and retry'
+    1602 = 'Cancelled by the user'
+    1603 = 'Fatal error: often a pending reboot, an orphaned registration (see above) or security software - check the log'
+    1612 = 'Installer source unavailable: the cached installer is missing (orphaned registration) - repair with the exact same version'
+    1618 = 'Another install was in progress: retry when it finishes, or after a reboot'
+    1625 = 'Blocked by policy (Group Policy / software restriction)'
+    1638 = 'Another version is already installed: installing an older v14 over a newer one always fails; if a NEWER installer fails with this, look for orphaned entries above'
+    1714 = 'The old version could not be removed, usually because its cached MSI is missing (orphan) - see above'
+}
+function Get-InstallerCode($Code) {
+    if ("$Code" -match '^0x8007([0-9a-fA-F]{4})$') { [Convert]::ToInt32($Matches[1], 16) }
+    elseif ("$Code" -match '^0x0+$') { 0 }
+    elseif ("$Code" -match '^\d+$') { [int]$Code }
+    else { -1 }
+}
+function Get-InstallerHint($Code) {
+    $n = Get-InstallerCode $Code
+    if ($installerHints.ContainsKey($n)) { $installerHints[$n] } else { "Error $Code - check the installer log" }
+}
+$successCodes = 0, 3010, 1641
+
+# Burn logs from VC_redist.*.exe (%TEMP% of whoever ran it; Windows\Temp for SYSTEM/Windows Update)
+$logDirs = @($env:TEMP, (Join-Path $env:WINDIR 'Temp'))
+if ($isAdmin) { $logDirs += @(Get-ChildItem (Join-Path $env:SystemDrive 'Users\*\AppData\Local\Temp') -Directory -ErrorAction SilentlyContinue | ForEach-Object FullName) }
+$vcLogs = @(foreach ($d in $logDirs) { Get-ChildItem $d -Filter 'dd_vcredist*.log' -File -ErrorAction SilentlyContinue }) |
+    Sort-Object FullName -Unique | Where-Object { $_.LastWriteTime -ge $vcSince } | Sort-Object LastWriteTime
+$logRuns = @(foreach ($lf in $vcLogs) {
+    $exit = (Select-String -Path $lf.FullName -Pattern 'Exit code: (0x[0-9a-fA-F]+)' -ErrorAction SilentlyContinue | Select-Object -Last 1)
+    if (-not $exit) { continue }
+    $code = $exit.Matches[0].Groups[1].Value.ToLower()
+    $verLine  = Select-String -Path $lf.FullName -Pattern "WixBundleFileVersion' to value '([^']+)'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $planLine = Select-String -Path $lf.FullName -Pattern 'Plan begin, \d+ packages, action: (\w+)' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $larch = if ($lf.Name -match 'dd_vcredist_(amd64|x86|arm64)') { $Matches[1] -replace 'amd64', 'x64' } else { '?' }
+    $label = "VC_redist.$larch"
+    if ($verLine)  { $label += " $(ConvertTo-Ver3 $verLine.Matches[0].Groups[1].Value)" }
+    if ($planLine) { $label += " ($($planLine.Matches[0].Groups[1].Value.ToLower()))" }
+    [pscustomobject]@{ Time = $lf.LastWriteTime; Arch = $larch; Code = $code; Num = (Get-InstallerCode $code); Log = $lf.FullName; Name = $label }
+})
+foreach ($run in ($logRuns | Where-Object { $_.Num -notin $successCodes } | Sort-Object Time -Descending | Select-Object -First 5)) {
+    $laterOk = $logRuns | Where-Object { $_.Arch -eq $run.Arch -and $_.Time -gt $run.Time -and $_.Num -in $successCodes }
+    if ($laterOk) {
+        Add-Finding Info 'VC++ install' ("{0} failed on {1:g} ({2}) but a later install succeeded." -f $run.Name, $run.Time, $run.Code)
+    } else {
+        $sev = if ($run.Num -eq 1638) { 'Warn' } else { 'Problem' }
+        Add-Finding $sev 'VC++ install' ("{0} failed on {1:g} with {2}. Log: {3}" -f $run.Name, $run.Time, $run.Code, $run.Log) (Get-InstallerHint $run.Code)
+    }
+}
+
+# Windows Installer events (1033 install, 1034 removal): properties 0 = product, 3 = status
+$msiEvts = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034; StartTime = $vcSince } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Properties.Count -ge 4 -and "$($_.Properties[0].Value)" -match 'Visual C\+\+' })
+$msiFails = @($msiEvts | Where-Object { (Get-InstallerCode "$($_.Properties[3].Value)") -notin $successCodes })
+foreach ($grp in ($msiFails | Group-Object { "$($_.Properties[0].Value)|$($_.Properties[3].Value)" } | Select-Object -First 5)) {
+    $latest = $grp.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1
+    $pname = "$($latest.Properties[0].Value)"; $status = "$($latest.Properties[3].Value)"
+    $op = if ($latest.Id -eq 1034) { 'removal' } else { 'install' }
+    $laterOk = $msiEvts | Where-Object { "$($_.Properties[0].Value)" -eq $pname -and $_.Id -eq $latest.Id -and $_.TimeCreated -gt $latest.TimeCreated -and (Get-InstallerCode "$($_.Properties[3].Value)") -in $successCodes }
+    if ($laterOk) { Add-Finding Info 'VC++ install' ("{0} {1} failed with {2} on {3:g} but later succeeded." -f $pname, $op, $status, $latest.TimeCreated) }
+    else { Add-Finding Problem 'VC++ install' ("{0} {1} failed {2}x with {3}, last {4:g}." -f $pname, $op, $grp.Count, $status, $latest.TimeCreated) (Get-InstallerHint $status) }
+}
+if (-not ($logRuns | Where-Object { $_.Num -notin $successCodes }) -and -not $msiFails.Count) {
+    $lastRun = $logRuns | Sort-Object Time -Descending | Select-Object -First 1
+    $lastTxt = if ($lastRun) { " Last VC_redist run: {0:g}, {1}." -f $lastRun.Time, $lastRun.Name } else { '' }
+    Add-Finding OK 'VC++ install' "No failed Visual C++ installs in 90 days.$lastTxt"
+}
+
+# --- crashes inside the C++ runtime DLLs (any app)
+$vcModRegex = '^(vcruntime\d+(_1)?|msvcp\d+(_\w+)?|msvcr\d+|ucrtbase|concrt\d+|vcomp\d+)\.dll$'
+$vcCrashes = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'Application Error'; Id = 1000; StartTime = (Get-Date).AddDays(-30) } -ErrorAction SilentlyContinue |
+    Where-Object { $_.Properties.Count -ge 7 -and "$($_.Properties[3].Value)" -match $vcModRegex } |
+    ForEach-Object { [pscustomobject]@{ App = "$($_.Properties[0].Value)"; Module = "$($_.Properties[3].Value)"; Code = "$($_.Properties[6].Value)"; Time = $_.TimeCreated } })
+foreach ($g in ($vcCrashes | Group-Object App, Module | Select-Object -First 8)) {
+    $latest = $g.Group | Sort-Object Time -Descending | Select-Object -First 1
+    $hint = if ($latest.Module -match '^ucrtbase') {
+        'ucrtbase.dll is part of Windows: run -Repair (SFC) if many apps crash here; a single app crashing here is usually its own bug (code c0000409 = the app aborted)'
+    } else { 'Repair the matching Visual C++ redistributable (x86 for 32-bit apps); if it keeps crashing, report it to the app vendor' }
+    Add-Finding Warn 'VC++ crash' ("{0} crashed {1}x in {2} (last {3:g}, code 0x{4})" -f $latest.App, $g.Count, $latest.Module, $latest.Time, $latest.Code) $hint
+}
+
+if (-not $vcProblems -and $wiOk) { Add-Finding OK 'VC++ orphan' 'No orphaned or broken Visual C++ registrations found.' }
 
 # ---------------------------------------------------------------- repair
 if ($Repair) {
