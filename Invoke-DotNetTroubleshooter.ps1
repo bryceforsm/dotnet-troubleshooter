@@ -497,9 +497,15 @@ function Get-ModuleVersion($m) {
     if (-not $v) { $v = $m.FileVersionInfo.FileVersion }
     if ($v) { ($v -split '[+ ]')[0] } else { '?' }
 }
+$modSkipped = 0
 $netProcs = foreach ($p in Get-Process) {
+    if ($p.Id -in 0, 4) { continue }   # Idle / System
+    # Modules can't be read for protected, elevated or other users' processes (unless we're elevated).
+    # PowerShell then hands back nothing instead of throwing, so check the list before using it.
+    $mods = @()
+    try { $mods = @($p.Modules | Where-Object { $null -ne $_ -and $_.PSObject.Properties['ModuleName'] }) } catch { }
+    if (-not $mods.Count) { $modSkipped++; continue }
     try {
-        $mods = @($p.Modules)
         $clr  = $mods | Where-Object { $_.ModuleName -in 'clr.dll', 'mscorwks.dll' } | Select-Object -First 1
         $core = $mods | Where-Object { $_.ModuleName -eq 'coreclr.dll' } | Select-Object -First 1
         if (-not ($clr -or $core)) { continue }
@@ -534,6 +540,13 @@ $netProcs = foreach ($p in Get-Process) {
     } catch { }
 }
 $netProcs = @($netProcs)
+if ($modSkipped) {
+    if ($isAdmin) {
+        Add-Finding Info 'Process coverage' "$modSkipped protected process(es) could not be inspected for .NET (normal for system processes)."
+    } else {
+        Add-Finding Info 'Process coverage' "$modSkipped process(es) could not be inspected because this session is not elevated. A .NET app running elevated, as a service or as another user won't appear below." 'Re-run as administrator to include them'
+    }
+}
 if ($netProcs.Count) {
     $netProcs | Sort-Object Bits, PrivateGB -Descending | Format-Table Name, Id, Bits, Runtime, GUI, VCRT, PrivateGB, VirtualGB -AutoSize | Out-Host
     foreach ($np in ($netProcs | Where-Object { $_.Bits -eq 32 -and ($_.VirtualGB -gt 1.6 -or $_.PrivateGB -gt 1.2) })) {
